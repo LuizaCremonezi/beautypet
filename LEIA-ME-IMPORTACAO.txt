@@ -1,0 +1,39 @@
+BEAUTY PET — IMPORTADOR DE CADASTROS LEGADOS (versão inicial)
+
+1. Preserve seu projeto atual e faça backup do Supabase (banco e projeto web).
+2. Copie os arquivos desta versão por cima de uma cópia de desenvolvimento do seu projeto, mantendo o config/.env existente no seu computador. O pacote NÃO inclui senhas nem .env.
+3. Entre como ADMINISTRADOR e abra "Importar cadastros" no menu, ou /pages/importar-cadastros.php.
+4. Escolha o arquivo cadastros_beautypet_para_importacao.csv entregue separadamente.
+5. Clique em "Analisar sem gravar" e confira as linhas e os bloqueios. Nenhuma tabela é modificada na análise.
+6. Somente depois de fazer backup do banco, digite IMPORTAR e confirme: apenas linhas APROVADAS são gravadas.
+7. Linhas REVISAO ou BLOQUEADO não são gravadas. Corrija/avalie o arquivo original e refaça a análise para elas.
+
+LIMITAÇÕES IMPORTANTES:
+- Neste primeiro estágio, o upload aceita CSV já preparado, NÃO XLSX diretamente.
+- Raças sem correspondência no banco ficam em revisão. O importador NÃO cria raças automaticamente.
+- Espécies fora das cadastradas, sem telefone válido, ou sem nomes de tutor/pet são bloqueadas.
+- CPF com formato válido, mas pertencente a outra pessoa, não pode ser comprovado automaticamente.
+- A heurística de duplicidade pode não detectar homônimos ou animais diferentes com o mesmo nome.
+- Este pacote NÃO foi testado contra seu banco Supabase em produção; teste primeiro em cópia do banco.
+- O processo é idempotente para pets que tenham mesmo tutor+espécie+nome, mas isso não substitui revisão humana.
+- Não inclui interface de correção, exportação de relatório, nem função desfazer depois de commit.
+- Confirme que PHP possui pdo_pgsql, mbstring e iconv ativos.
+- Os dados são temporariamente armazenados em arquivo privado de sistema por até 1 hora de validade da sessão; evite hospedagem compartilhada insegura.
+- A coluna "endereco" antiga é preservada integralmente no campo logradouro para evitar parsing destrutivo de número/complemento.
+- A contagem do CSV corresponde a linhas com cliente ou pet preenchidos; compare eventuais linhas vazias ou registros apenas com outros campos no Excel original.
+
+ATUALIZAÇÃO DE SEGURANÇA — PACOTE REVISADO
+- Há botão para baixar relatório CSV de conferência (com linha, código antigo, estado e motivos).
+- Importação confirmada usa transação SERIALIZABLE e bloqueio consultivo PostgreSQL; falhas revertem o lote.
+- CPF e nome+telefone divergentes em cadastros existentes interrompem a transação.
+- Linhas sem CPF não são associadas automaticamente a cadastro existente que tenha CPF: revisão manual necessária.
+- O CSV enviado para relatório contém dados pessoais; armazene-o de forma segura (LGPD).
+- ATENÇÃO: o pacote é instalável, mas não foi testado contra uma cópia real do banco com suas restrições e dados. Não é possível garantir uma importação íntegra em produção somente com os arquivos de estrutura.
+- Raças não cadastradas continuam exigindo revisão. Em especial, o banco informado possui apenas quatro raças. Não clique em Importar sem avaliar o total de aprovados, revisões e bloqueios.
+- Não há tela de desfazer um lote já concluído; antes de gravar, produza um backup restaurável do banco.
+
+ATUALIZAÇÃO — RAÇAS: novas raças válidas são inseridas automaticamente na mesma transação dos pets. Comparação normalizada por maiúsculas/minúsculas, acentos e espaços, separada por espécie. Raças preexistentes são reutilizadas; não são renomeadas nem apagadas. Se houver duplicadas antigas no banco, utiliza o menor ID, sem mesclar outros dados. Raça em branco continua sem raça.
+
+VERSÃO FLEXÍVEL: telefone ausente salvo como string vazia (coluna NOT NULL), CPF inválido ignorado, pet sem nome gera apenas tutor; espécies reconhecidas ainda ausentes são criadas. Faça backup e teste num projeto Supabase separado antes de produção. Nenhum dado foi importado automaticamente.
+
+CORREÇÃO 2026-10-21 — SQLSTATE[22001]: se pets.sexo estiver como VARCHAR(8), o valor NAO_INFORMADO não cabe. Execute SQL-AJUSTE-SEXO-PETS.sql no Supabase antes da importação. A página passa a avisar com clareza antes de iniciar a transação. Nada é cortado automaticamente. Verifique também restrições CHECK existentes no banco.
