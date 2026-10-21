@@ -1,25 +1,77 @@
-<?php // Executa esta instrução como parte da regra de negócio desta página.
+<?php
 
-function carregarEnv($arquivo) // Define uma função reutilizável que concentra esta regra do sistema.
-{ // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
-    if (!file_exists($arquivo)) { // Testa esta condição antes de executar o bloco correspondente.
-        throw new Exception("Arquivo .env não encontrado."); // Lança uma exceção para interromper a operação com uma mensagem controlada.
-    } // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
+declare(strict_types=1);
 
-    $linhas = file($arquivo, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES); // Armazena em linhas o valor usado nas próximas etapas deste fluxo.
+/**
+ * Carrega variáveis de um arquivo .env.
+ *
+ * Em produção, como no Render, o arquivo .env pode não existir,
+ * pois as variáveis são configuradas diretamente no ambiente.
+ */
+function carregarEnv(string $arquivo): void
+{
+    // No Render, o .env não existe fisicamente.
+    // Nesse caso, usamos as variáveis configuradas no painel.
+    if (!is_file($arquivo)) {
+        return;
+    }
 
-    foreach ($linhas as $linha) { // Percorre a coleção e processa cada registro individualmente.
+    $linhas = file(
+        $arquivo,
+        FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES
+    );
 
-        // Ignora comentários
-        if (str_starts_with(trim($linha), '#')) { // Testa esta condição antes de executar o bloco correspondente.
-            continue; // Executa esta instrução como parte da regra de negócio desta página.
-        } // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
+    if ($linhas === false) {
+        return;
+    }
 
-        // Separa o nome da variável do valor
-        [$nome, $valor] = array_pad(explode('=', $linha, 2), 2, null); // Executa esta instrução como parte da regra de negócio desta página.
+    foreach ($linhas as $linha) {
+        $linha = trim($linha);
 
-        if ($nome !== null && $valor !== null) { // Testa esta condição antes de executar o bloco correspondente.
-            $_ENV[trim($nome)] = trim($valor); // Executa esta instrução como parte da regra de negócio desta página.
-        } // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
-    } // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
-} // Abre, fecha ou encerra a estrutura iniciada nas linhas relacionadas.
+        // Ignora linhas vazias e comentários.
+        if ($linha === '' || str_starts_with($linha, '#')) {
+            continue;
+        }
+
+        // Ignora linhas que não possuem "=".
+        if (!str_contains($linha, '=')) {
+            continue;
+        }
+
+        [$nome, $valor] = explode('=', $linha, 2);
+
+        $nome = trim($nome);
+        $valor = trim($valor);
+
+        if ($nome === '') {
+            continue;
+        }
+
+        // Remove aspas usadas no .env.
+        if (
+            strlen($valor) >= 2 &&
+            (
+                ($valor[0] === '"' && $valor[strlen($valor) - 1] === '"') ||
+                ($valor[0] === "'" && $valor[strlen($valor) - 1] === "'")
+            )
+        ) {
+            $valor = substr($valor, 1, -1);
+        }
+
+        /*
+         * Variáveis definidas pelo servidor têm prioridade.
+         * Assim, o Render nunca é sobrescrito por um eventual .env.
+         */
+        $valorExistente = getenv($nome);
+
+        if ($valorExistente !== false && $valorExistente !== '') {
+            $_ENV[$nome] = $valorExistente;
+            $_SERVER[$nome] = $valorExistente;
+            continue;
+        }
+
+        $_ENV[$nome] = $valor;
+        $_SERVER[$nome] = $valor;
+        putenv("{$nome}={$valor}");
+    }
+}
