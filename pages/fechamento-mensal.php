@@ -280,7 +280,7 @@ $stmt = $pdo->prepare(
         f.data_fechamento,
         f.status,
         f.valor_abertura_caixa,
-        f.valor_dinheiro_contado,
+        f.valor_dinheiro_contado AS dinheiro_contado,
         COALESCE(lanc.total_adicionais, 0) AS total_adicionais,
         COALESCE(lanc.total_comercializado, 0) AS total_comercializado,
         COALESCE(op.quantidade_servicos, 0) AS quantidade_servicos_operacionais,

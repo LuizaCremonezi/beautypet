@@ -134,7 +134,7 @@ function resumoDoDia(PDO $pdo, string $data, ?int $petsSemRetornoPrecalculado = 
                 JOIN clientes c ON c.id = p.cliente_id AND c.ativo = TRUE
                 JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
                 GROUP BY l.pet_id
-                HAVING MAX(f.data_fechamento) <= CURRENT_DATE - :dias
+                HAVING MAX(f.data_fechamento) <= CURRENT_DATE - CAST(:dias AS integer)
              ) afastados"
         );
         $stmt->bindValue(':dias', ANALISE_DIAS_SEM_RETORNO, PDO::PARAM_INT);
@@ -429,7 +429,7 @@ function petsSemRetorno(PDO $pdo, int $diasMinimos = ANALISE_DIAS_SEM_RETORNO, i
             JOIN clientes c ON c.id = p.cliente_id
             WHERE p.ativo = TRUE
               AND c.ativo = TRUE
-              AND u.ultima_visita <= CURRENT_DATE - :dias
+              AND u.ultima_visita <= CURRENT_DATE - CAST(:dias AS integer)
          )
          SELECT
             pet_id,
