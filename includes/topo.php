@@ -4,6 +4,7 @@
  * RESPONSABILIDADE: Cabeçalho e menu lateral compartilhados.
  * Monta a estrutura visual comum das páginas, identifica o item ativo, mostra o usuário logado e disponibiliza busca e ações de conta.
  */
+
 $tituloPagina = $tituloPagina ?? 'Beauty Pet';
 // Informa ao menu lateral qual item deve aparecer destacado nesta página.
 $paginaAtiva = $paginaAtiva ?? '';
@@ -82,17 +83,23 @@ try {
         <link rel="stylesheet" href="<?= BASE_URL ?>/assets/css/<?= $arquivoCssPagina ?>.css?v=css-dividido-v1">
     <?php endforeach; ?>
 
-    <?php if (($paginaAtiva ?? '') === 'dashboard'): ?>
-        <!-- MERGE DASHBOARD: estilos usados somente pela tela do Dashboard (cards, graficos, abas).
-             Carregado depois dos CSS acima e so nesta pagina, para que nenhuma outra tela mude. -->
-        <link rel="stylesheet" href="<?= BASE_URL ?>/assets/dashboard.css?v=dashboard-v1">
-    <?php endif; ?>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
 
     <!-- [BP-ALTERAÇÃO #4] Preferências de aparência/acessibilidade (escolhidas em pages/configuracoes.php).
          Ficam no <head> para o tema escuro ser aplicado antes de a página aparecer. -->
     <link rel="stylesheet" href="<?= BASE_URL ?>/assets/css/preferencias.css?v=bp-config-v1">
     <script src="<?= BASE_URL ?>/assets/js/preferencias.js?v=bp-config-v1"></script>
+
+    <!-- [BP-CARREGANDO] Heurística 1 de Nielsen (visibilidade do status do sistema): bolinha de carregamento nos botões,
+         bloqueio de envio duplicado e aviso de internet. Vale para TODOS os formulários sem alterar as páginas. Veja o topo do carregando.js. -->
+    <link rel="stylesheet" href="<?= BASE_URL ?>/assets/css/carregamento-global.css?v=bp-carregando-v1">
+    <script src="<?= BASE_URL ?>/assets/js/carregamento-global.js?v=bp-carregando-v1"></script>
+
+    <!-- [BP-TOAST] Mensagens de sucesso e de erro viram toast: flutuam na parte de baixo da tela. Sucesso some em 7 segundos com fade-out;
+         erro fica até a pessoa fechar e leva ao campo que precisa ser corrigido (Heurística 9).
+         As páginas continuam usando <div class="message success|error"> normalmente. Veja o topo do toast-mensagens.js. -->
+    <link rel="stylesheet" href="<?= BASE_URL ?>/assets/css/toast-mensagens.css?v=bp-toast-v1">
+    <script src="<?= BASE_URL ?>/assets/js/toast-mensagens.js?v=bp-toast-v1"></script>
 </head>
 <body>
 <!-- [BP-ALTERAÇÃO #4] Acessibilidade: quem usa teclado ou leitor de tela pula direto o menu. Só aparece ao receber foco (Tab). -->
@@ -108,14 +115,18 @@ try {
         </div>
 
         <nav>
+            <?php /* [BP-ATALHOS] Cada item do menu ganhou 2 atributos:
+                     data-atalho="X"          -> a letra usada com Alt (lida pelo script no rodape.php, que faz a navegação e mostra a dica).
+                     aria-keyshortcuts="Alt+X" -> avisa leitores de tela qual é o atalho do item.
+                     Para trocar uma letra, mude os DOIS atributos do item. */ ?>
             <?php /* [BP-ALTERAÇÃO #4] aria-label: com o menu recolhido o texto fica invisível, e o leitor de tela (cegos) não lia o nome do item. */ ?>
-            <a href="<?= BASE_URL ?>/index.php" aria-label="Dashboard"
+            <a href="<?= BASE_URL ?>/index.php" aria-label="Dashboard" data-atalho="I" aria-keyshortcuts="Alt+I"
                 class="menu-item <?= $paginaAtiva === 'dashboard' ? 'active' : '' ?>">
                 <i class="fa-solid fa-table-columns"></i>
                 <span>Dashboard</span>
             </a>
 
-            <a href="<?= BASE_URL ?>/pages/agenda.php" aria-label="Agenda"
+            <a href="<?= BASE_URL ?>/pages/agenda.php" aria-label="Agenda" data-atalho="A" aria-keyshortcuts="Alt+A"
                 class="menu-item <?= in_array($paginaAtiva, ['agenda', 'solicitacoes-agendamento'], true) ? 'active' : '' ?>">
                 <i class="fa-regular fa-calendar"></i>
                 <span>Agenda</span>
@@ -130,12 +141,12 @@ try {
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </summary>
 
-                <a href="<?= BASE_URL ?>/pages/fechamento-diario.php" class="submenu <?= $paginaAtiva === 'fechamento-diario' ? 'active' : '' ?>">
+                <a href="<?= BASE_URL ?>/pages/fechamento-diario.php" data-atalho="R" aria-keyshortcuts="Alt+R" class="submenu <?= $paginaAtiva === 'fechamento-diario' ? 'active' : '' ?>">
                     <i class="fa-solid fa-calendar-day"></i>
                     <span>Diário</span>
                 </a>
 
-                <a href="<?= BASE_URL ?>/pages/fechamento-mensal.php" class="submenu <?= $paginaAtiva === 'fechamento-mensal' ? 'active' : '' ?>">
+                <a href="<?= BASE_URL ?>/pages/fechamento-mensal.php" data-atalho="M" aria-keyshortcuts="Alt+M" class="submenu <?= $paginaAtiva === 'fechamento-mensal' ? 'active' : '' ?>">
                     <i class="fa-solid fa-calendar-week"></i>
                     <span>Mensal</span>
                 </a>
@@ -150,13 +161,13 @@ try {
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </summary>
 
-                <a href="<?= BASE_URL ?>/pages/cadastro-tutor.php"
+                <a href="<?= BASE_URL ?>/pages/cadastro-tutor.php" data-atalho="U" aria-keyshortcuts="Alt+U"
                     class="submenu <?= $paginaAtiva === 'cadastro-tutor' ? 'active' : '' ?>">
                     <i class="fa-solid fa-user-plus"></i>
                     <span>Cadastro</span>
                 </a>
 
-                <a href="<?= BASE_URL ?>/pages/fichas-tutores.php"
+                <a href="<?= BASE_URL ?>/pages/fichas-tutores.php" data-atalho="O" aria-keyshortcuts="Alt+O"
                     class="submenu <?= $paginaAtiva === 'fichas-tutores' ? 'active' : '' ?>">
                     <i class="fa-regular fa-address-card"></i>
                     <span>Fichas</span>
@@ -172,13 +183,13 @@ try {
                     <i class="fa-solid fa-chevron-down arrow"></i>
                 </summary>
 
-                <a href="<?= BASE_URL ?>/pages/cadastro-pet.php"
+                <a href="<?= BASE_URL ?>/pages/cadastro-pet.php" data-atalho="P" aria-keyshortcuts="Alt+P"
                     class="submenu <?= $paginaAtiva === 'cadastro-pet' ? 'active' : '' ?>">
                     <i class="fa-solid fa-dog"></i>
                     <span>Cadastro</span>
                 </a>
 
-                <a href="<?= BASE_URL ?>/pages/fichas-pets.php"
+                <a href="<?= BASE_URL ?>/pages/fichas-pets.php" data-atalho="X" aria-keyshortcuts="Alt+X"
                     class="submenu <?= $paginaAtiva === 'fichas-pets' ? 'active' : '' ?>">
                     <i class="fa-solid fa-notes-medical"></i>
                     <span>Fichas</span>
@@ -186,18 +197,13 @@ try {
             </details>
 
             <?php /* [BP-ALTERAÇÃO #5] Financeiro e Configurações: as páginas foram criadas e o item fica destacado quando aberto. */ ?>
-            <a href="<?= BASE_URL ?>/pages/financeiro.php" aria-label="Financeiro"
+            <a href="<?= BASE_URL ?>/pages/financeiro.php" aria-label="Financeiro" data-atalho="N" aria-keyshortcuts="Alt+N"
                 class="menu-item <?= $paginaAtiva === 'financeiro' ? 'active' : '' ?>">
                 <i class="fa-solid fa-dollar-sign"></i>
                 <span>Financeiro</span>
             </a>
 
-            <?php if (($usuarioAtual['perfil'] ?? null) === 'ADMINISTRADOR'): ?>
-            <a href="<?= BASE_URL ?>/pages/importar-cadastros.php" class="menu-item <?= $paginaAtiva === 'importar-cadastros' ? 'active' : '' ?>" aria-label="Importar cadastros">
-                <div class="menu-left"><i class="fa-solid fa-file-import"></i><span>Importar cadastros</span></div>
-            </a>
-            <?php endif; ?>
-            <a href="<?= BASE_URL ?>/pages/configuracoes.php" aria-label="Configurações"
+            <a href="<?= BASE_URL ?>/pages/configuracoes.php" aria-label="Configurações" data-atalho="G" aria-keyshortcuts="Alt+G"
                 class="menu-item <?= $paginaAtiva === 'configuracoes' ? 'active' : '' ?>">
                 <i class="fa-solid fa-gear"></i>
                 <span>Configurações</span>
@@ -336,10 +342,8 @@ try {
         <?php if (($mensagemUsuario['tipo'] ?? '') === 'success'): ?>
             <!-- [BP-ALTERAÇÃO #4] A mensagem "Usuário alterado para..." era gravada mas nunca aparecia
                  (o modal só abre sozinho quando dá erro). Agora aparece um aviso no canto da tela. -->
-            <div class="bp-aviso-flutuante" role="status">
-                <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
-                <span><?= escapar($mensagemUsuario['texto']) ?></span>
-            </div>
+            <!-- [BP-TOAST] Passa a usar o mesmo toast das outras mensagens de sucesso (antes era um aviso verde à parte). -->
+            <div class="message success" role="status"><?= escapar($mensagemUsuario['texto']) ?></div>
         <?php endif; ?>
 
         <!-- Área principal onde o conteúdo específico da página é exibido. -->

@@ -167,72 +167,89 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Identifica qual ação o formulário solicitou para direcionar o processamento correto.
     $acao = (string) ($_POST['acao'] ?? '');
 
-    // Verifica a condição abaixo antes de executar este bloco.
-    if ($acao === 'finalizar_mes' && !$mensalFechado) {
-        // Guarda observações informadas pela equipe para acompanhar o cadastro, agendamento ou lançamento.
-        $observacoes = textoOuNull($_POST['observacoes'] ?? null);
+    // HEURÍSTICA 9: antes não havia try/catch; uma falha do banco virava página de erro fatal.
+    try {
+        // Verifica a condição abaixo antes de executar este bloco.
+        if ($acao === 'finalizar_mes' && !$mensalFechado) {
+            // Guarda observações informadas pela equipe para acompanhar o cadastro, agendamento ou lançamento.
+            $observacoes = textoOuNull($_POST['observacoes'] ?? null);
 
-        // Prepara uma consulta em "fechamentos_diarios" para carregar os dados necessários a esta etapa.
-        $stmt = $pdo->prepare(
-            "SELECT COUNT(*)
-             FROM fechamentos_diarios f
-             WHERE f.data_fechamento BETWEEN ? AND ?
-               AND f.status <> 'FECHADO'
-               AND EXISTS (
-                    SELECT 1
-                    FROM lancamentos_diarios l
-                    WHERE l.fechamento_diario_id = f.id
-               )"
-        );
-        // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-        $stmt->execute([$inicioMes, $fimMes]);
-        // Obtém somente a primeira coluna do resultado, útil para contagens, IDs e totais simples.
-        $diasPendentes = (int) $stmt->fetchColumn();
+            // Prepara uma consulta em "fechamentos_diarios" para carregar os dados necessários a esta etapa.
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM fechamentos_diarios f
+                 WHERE f.data_fechamento BETWEEN ? AND ?
+                   AND f.status <> 'FECHADO'
+                   AND EXISTS (
+                        SELECT 1
+                        FROM lancamentos_diarios l
+                        WHERE l.fechamento_diario_id = f.id
+                   )"
+            );
+            // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
+            $stmt->execute([$inicioMes, $fimMes]);
+            // Obtém somente a primeira coluna do resultado, útil para contagens, IDs e totais simples.
+            $diasPendentes = (int) $stmt->fetchColumn();
+
+            // Verifica a condição abaixo antes de executar este bloco.
+            if ($diasPendentes > 0) {
+                // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
+                // HEURÍSTICA 9: informa quantos dias faltam e onde resolver.
+                $mensagem = 'Ainda ' . ($diasPendentes === 1 ? 'existe 1 dia' : 'existem ' . $diasPendentes . ' dias')
+                    . ' com movimento sem fechamento. Abra o Fechamento diário desses dias, finalize-os e depois feche o mês.';
+                // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
+                $tipoMensagem = 'error';
+            // Quando nenhuma das condições anteriores for atendida, executa este fluxo alternativo.
+            } else {
+                // Prepara a atualização do registro correspondente em "fechamentos_mensais" com os novos dados.
+                $stmt = $pdo->prepare(
+                    "UPDATE fechamentos_mensais
+                     SET status = 'FECHADO',
+                         observacoes = ?,
+                         fechado_por = ?,
+                         fechado_em = CURRENT_TIMESTAMP
+                     WHERE id = ?"
+                );
+                // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
+                $stmt->execute([$observacoes, $usuarioId, $fechamentoMensalId]);
+
+                // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
+                header('Location: fechamento-mensal.php?mes=' . urlencode($competencia) . '&fechado=1');
+                // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
+                exit;
+            }
+        }
 
         // Verifica a condição abaixo antes de executar este bloco.
-        if ($diasPendentes > 0) {
-            // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-            $mensagem = 'Ainda existem dias com movimento que não foram finalizados. Feche esses dias antes de fechar o mês.';
-            // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
-            $tipoMensagem = 'error';
-        // Quando nenhuma das condições anteriores for atendida, executa este fluxo alternativo.
-        } else {
-            // Prepara a atualização do registro correspondente em "fechamentos_mensais" com os novos dados.
+        if ($acao === 'reabrir_mes' && $administrador && $mensalFechado) {
+            // Prepara uma consulta em "vw_fechamento_diario" para carregar os dados necessários a esta etapa.
             $stmt = $pdo->prepare(
                 "UPDATE fechamentos_mensais
-                 SET status = 'FECHADO',
-                     observacoes = ?,
-                     fechado_por = ?,
-                     fechado_em = CURRENT_TIMESTAMP
+                 SET status = 'REABERTO',
+                     fechado_por = NULL,
+                     fechado_em = NULL
                  WHERE id = ?"
             );
             // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-            $stmt->execute([$observacoes, $usuarioId, $fechamentoMensalId]);
+            $stmt->execute([$fechamentoMensalId]);
 
             // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
-            header('Location: fechamento-mensal.php?mes=' . urlencode($competencia) . '&fechado=1');
+            header('Location: fechamento-mensal.php?mes=' . urlencode($competencia) . '&reaberto=1');
             // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
             exit;
         }
-    }
 
-    // Verifica a condição abaixo antes de executar este bloco.
-    if ($acao === 'reabrir_mes' && $administrador && $mensalFechado) {
-        // Prepara uma consulta em "vw_fechamento_diario" para carregar os dados necessários a esta etapa.
-        $stmt = $pdo->prepare(
-            "UPDATE fechamentos_mensais
-             SET status = 'REABERTO',
-                 fechado_por = NULL,
-                 fechado_em = NULL
-             WHERE id = ?"
-        );
-        // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-        $stmt->execute([$fechamentoMensalId]);
-
-        // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
-        header('Location: fechamento-mensal.php?mes=' . urlencode($competencia) . '&reaberto=1');
-        // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
-        exit;
+        // HEURÍSTICA 9: antes o clique de quem não é administrador era ignorado sem explicação.
+        if ($acao === 'reabrir_mes' && !$administrador) {
+            $mensagem = 'Somente administradores podem reabrir o mês. Peça a um administrador ou troque de usuário no menu do perfil.';
+            $tipoMensagem = 'error';
+        }
+    } catch (Throwable $erro) {
+        error_log('[BeautyPet] fechamento-mensal: ' . $erro->getMessage());
+        $mensagem = $acao === 'reabrir_mes'
+            ? 'Não foi possível reabrir o mês agora. Nada foi alterado: tente novamente em instantes.'
+            : 'Não foi possível fechar o mês agora. Nada foi alterado: confira a internet e tente novamente.';
+        $tipoMensagem = 'error';
     }
 }
 
@@ -458,7 +475,7 @@ require __DIR__ . '/../includes/topo.php';
 ?>
 
 <div class="page monthly-close-page">
-    <div class="monthly-close-heading">
+   <div class="monthly-close-heading">
         <div>
             <span class="monthly-eyebrow">Financeiro</span>
             <h1>Fechamento mensal</h1>
@@ -466,23 +483,22 @@ require __DIR__ . '/../includes/topo.php';
         </div>
 
         <div class="monthly-heading-actions">
-            <span class="monthly-status <?= escapar(classeStatusMensal($fechamentoMensal['status'] ?? 'ABERTO')) ?>">
+            <span class="monthly-status general-status">
                 <i class="fa-solid fa-circle"></i>
                 <?= escapar(nomeStatusMensal($fechamentoMensal['status'] ?? 'ABERTO')) ?>
             </span>
 
-            <?php if (!$mensalFechado): ?>
+       <?php if (!$mensalFechado): ?>
                 <button class="monthly-primary-action" type="button" data-open-monthly-finish>
-                    <i class="fa-solid fa-lock"></i>
                     Fechar mês
                 </button>
+
             <?php elseif ($administrador): ?>
                 <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
                 <form method="post" action="fechamento-mensal.php?mes=<?= escapar($competencia) ?>" onsubmit="return confirm('Reabrir este fechamento mensal?');">
                     <!-- Campo "acao" utilizado para enviar esta informação no formulário. -->
                     <input type="hidden" name="acao" value="reabrir_mes">
                     <button class="monthly-secondary-action" type="submit">
-                        <i class="fa-solid fa-lock-open"></i>
                         Reabrir mês
                     </button>
                 </form>
@@ -491,32 +507,32 @@ require __DIR__ . '/../includes/topo.php';
     </div>
 
     <?php if ($mensagem !== ''): ?>
-        <div class="message <?= escapar($tipoMensagem) ?> monthly-message">
+        <div class="message <?= escapar($tipoMensagem) ?> monthly-message" role="<?= $tipoMensagem === 'error' ? 'alert' : 'status' ?>">
             <?= escapar($mensagem) ?>
         </div>
     <?php endif; ?>
 
-    <div class="monthly-period-bar">
-        <a href="fechamento-mensal.php?mes=<?= escapar($competenciaAnterior) ?>" aria-label="Mês anterior">
+<div class="monthly-period-bar">
+        <!-- 1. Seta Esquerda -->
+        <a class="monthly-period-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaAnterior) ?>" aria-label="Mês anterior">
             <i class="fa-solid fa-chevron-left"></i>
+        </a>
+
+        <!-- 2. Calendário / Mês (Submete automaticamente ao selecionar) -->
+        <form method="get" action="fechamento-mensal.php" class="monthly-period-form">
+            <label for="monthlyPeriod">Escolher mês</label>
+            <input id="monthlyPeriod" name="mes" type="month" value="<?= escapar($competencia) ?>" onchange="this.form.submit()">
+        </form>
+
+        <!-- 3. Seta Direita -->
+        <a class="monthly-period-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaSeguinte) ?>" aria-label="Mês seguinte">
+            <i class="fa-solid fa-chevron-right"></i>
         </a>
 
         <div class="monthly-period-title">
             <small>Competência</small>
             <strong><?= escapar(nomeMesFechamento($mes)) ?> de <?= $ano ?></strong>
         </div>
-
-        <a href="fechamento-mensal.php?mes=<?= escapar($competenciaSeguinte) ?>" aria-label="Mês seguinte">
-            <i class="fa-solid fa-chevron-right"></i>
-        </a>
-
-        <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
-        <form method="get" action="fechamento-mensal.php">
-            <!-- Rótulo do campo "Escolher mês", indicando ao usuário qual informação deve ser preenchida. -->
-            <label for="monthlyPeriod">Escolher mês</label>
-            <!-- Campo "mes" utilizado para enviar esta informação no formulário. -->
-            <input id="monthlyPeriod" name="mes" type="month" value="<?= escapar($competencia) ?>" onchange="this.form.submit()">
-        </form>
     </div>
 
     <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
@@ -614,7 +630,7 @@ require __DIR__ . '/../includes/topo.php';
         </div>
     </section>
 
-    <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
+   <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
     <section class="monthly-summary-section">
         <div class="monthly-section-title">
             <div>
@@ -624,39 +640,45 @@ require __DIR__ . '/../includes/topo.php';
             <small>Calculado automaticamente a partir dos lançamentos diários.</small>
         </div>
 
-        <!-- Bloco visual "monthly-summary-grid" que organiza esta parte da interface. -->
+        <!-- Bloco visual adaptado com o mesmo padrão visual de cartões (daily-summary-grid) -->
         <div class="monthly-summary-grid">
-            <article class="monthly-summary-card featured">
+            <article class="daily-summary-card emphasis">
                 <span>Total comercializado</span>
                 <strong><?= formatarMoeda($totais['comercializado']) ?></strong>
                 <small>Serviços + adicionais</small>
             </article>
-            <article class="monthly-summary-card">
+
+            <article class="daily-summary-card">
                 <span>Total recebido</span>
                 <strong><?= formatarMoeda($totais['recebido']) ?></strong>
                 <small>Inclui pagamentos de débitos antigos</small>
             </article>
-            <article class="monthly-summary-card">
+
+            <article class="daily-summary-card">
                 <span>Pets únicos</span>
                 <strong><?= $petsUnicosMes ?></strong>
                 <small><?= $totais['servicos'] ?> serviço(s) realizado(s)</small>
             </article>
-            <article class="monthly-summary-card">
+
+            <article class="daily-summary-card">
                 <span>Adicionais</span>
                 <strong><?= formatarMoeda($totais['adicionais']) ?></strong>
                 <small>Somados aos serviços</small>
             </article>
-            <article class="monthly-summary-card debt">
+
+            <article class="daily-summary-card danger-soft">
                 <span>Débito gerado</span>
                 <strong><?= formatarMoeda($totais['debito_gerado']) ?></strong>
                 <small>Valores que ficaram para pagar</small>
             </article>
-            <article class="monthly-summary-card paid">
+
+            <article class="daily-summary-card green-soft">
                 <span>Débito pago</span>
                 <strong><?= formatarMoeda($totais['debito_pago']) ?></strong>
                 <small>Pagamentos de dívidas antigas</small>
             </article>
-            <article class="monthly-summary-card credit">
+
+            <article class="daily-summary-card green-soft">
                 <span>Crédito utilizado</span>
                 <strong><?= formatarMoeda($totais['credito_utilizado']) ?></strong>
                 <small>Saldo de crédito usado no mês</small>
@@ -707,7 +729,7 @@ require __DIR__ . '/../includes/topo.php';
                 </div>
             </div>
 
-            <div class="monthly-payment-list">
+        <div class="monthly-payment-list">
                 <article>
                     <span class="monthly-payment-icon"><i class="fa-solid fa-money-bill-wave"></i></span>
                     <div><small>Dinheiro</small><strong><?= formatarMoeda($totais['dinheiro']) ?></strong></div>
@@ -721,11 +743,10 @@ require __DIR__ . '/../includes/topo.php';
                     <div><small>Cartão</small><strong><?= formatarMoeda($totais['cartao']) ?></strong></div>
                 </article>
             </div>
-
-            <div class="monthly-payment-total">
-                <span>Total recebido</span>
-                <strong><?= formatarMoeda($totais['recebido']) ?></strong>
-            </div>
+                <div class="monthly-payment-total">
+                    <span>Total recebido:</span>
+                    <strong><?= formatarMoeda($totais['recebido']) ?></strong>
+                </div>
         </section>
     </div>
 </div>
@@ -762,7 +783,6 @@ require __DIR__ . '/../includes/topo.php';
             <div class="monthly-finish-actions">
                 <button class="monthly-secondary-action" type="button" data-close-monthly-finish>Cancelar</button>
                 <button class="monthly-primary-action" type="submit">
-                    <i class="fa-solid fa-lock"></i>
                     Confirmar fechamento
                 </button>
             </div>

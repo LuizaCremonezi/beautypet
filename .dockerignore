@@ -1,0 +1,8 @@
+# Credenciais locais nunca devem entrar na imagem Docker.
+config/.env
+
+# Metadados e arquivos locais desnecessários no build.
+.git
+.gitignore
+.DS_Store
+Thumbs.db

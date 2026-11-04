@@ -1,0 +1,163 @@
+/*
+ * ARQUIVO: assets/css/carregamento-global.css
+ * [BP-CARREGANDO] Arquivo novo. Visual do assets/js/carregamento-global.js (veja as explicações lá).
+ * O tema escuro já é tratado pelo preferencias.css (inverte a página inteira), então aqui só há cores claras.
+ */
+
+/* ---------- Bolinha girando (usada no botão e na tela de espera) ---------- */
+.bp-spinner {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    flex: 0 0 auto;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    vertical-align: -0.15em;
+    animation: bp-girar .7s linear infinite;
+}
+
+.bp-spinner-grande {
+    width: 42px;
+    height: 42px;
+    border-width: 4px;
+    color: #f3b000;
+}
+
+@keyframes bp-girar {
+    to { transform: rotate(360deg); }
+}
+
+/* ---------- Botão carregando ---------- */
+.bp-carregando {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    cursor: progress !important;
+    opacity: .85;
+    pointer-events: none;
+}
+
+/* ---------- Feedback de clique em todos os botões (a pessoa vê que o clique foi recebido) ---------- */
+button:not(:disabled),
+input[type="submit"]:not(:disabled),
+input[type="button"]:not(:disabled),
+.button,
+[role="button"] {
+    transition: transform .08s ease, filter .12s ease;
+}
+
+button:not(:disabled):active,
+input[type="submit"]:not(:disabled):active,
+input[type="button"]:not(:disabled):active,
+.button:active,
+[role="button"]:active {
+    transform: scale(.97);
+    filter: brightness(.94);
+}
+
+button:disabled,
+input[type="submit"]:disabled {
+    cursor: not-allowed;
+}
+
+/* ---------- Tela de espera (bloqueia novos cliques enquanto grava no banco) ---------- */
+.bp-tela-espera {
+    position: fixed;
+    inset: 0;
+    z-index: 20000;
+    display: grid;
+    place-items: center;
+    padding: 16px;
+    background: rgba(17, 24, 39, .45);
+    backdrop-filter: blur(2px);
+    cursor: progress;
+    animation: bp-aparecer .15s ease;
+}
+
+.bp-tela-espera[hidden] {
+    display: none;
+}
+
+.bp-tela-espera:focus {
+    outline: none;
+}
+
+.bp-tela-espera-caixa {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    width: min(360px, 100%);
+    padding: 28px 24px;
+    border-radius: 16px;
+    background: #fff;
+    color: #1f2937;
+    text-align: center;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, .25);
+}
+
+.bp-tela-espera-caixa strong {
+    font-size: 18px;
+}
+
+.bp-tela-espera-caixa small {
+    color: #5b6170;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.bp-tela-espera-lento {
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #fff7d6;
+    color: #7a5600 !important;
+}
+
+html.bp-ocupado,
+html.bp-ocupado body {
+    cursor: progress;
+}
+
+/* ---------- Barra fina no topo ao trocar de página ---------- */
+.bp-barra-carregando {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 20001;
+    width: 0;
+    height: 3px;
+    background: #f3b000;
+    box-shadow: 0 0 8px rgba(243, 176, 0, .6);
+    opacity: 0;
+    pointer-events: none;
+}
+
+.bp-barra-carregando.is-ativa {
+    opacity: 1;
+    /* Avança rápido no começo e vai desacelerando: a barra só completa quando a página nova aparece. */
+    animation: bp-barra 8s cubic-bezier(.1, .7, .2, 1) forwards;
+}
+
+@keyframes bp-barra {
+    from { width: 0; }
+    to { width: 92%; }
+}
+
+@keyframes bp-aparecer {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* ---------- Acessibilidade: quem desliga animações (sistema ou Configurações) ---------- */
+@media (prefers-reduced-motion: reduce) {
+    .bp-spinner { animation-duration: 1.6s; }
+    .bp-tela-espera { animation: none; }
+    .bp-barra-carregando.is-ativa { animation: none; width: 92%; }
+    button, input[type="submit"], .button, [role="button"] { transition: none; }
+}
+
+html[data-reduzir-animacoes="1"] .bp-spinner { animation-duration: 1.6s; }
+html[data-reduzir-animacoes="1"] .bp-tela-espera { animation: none; }
+html[data-reduzir-animacoes="1"] .bp-barra-carregando.is-ativa { animation: none; width: 92%; }

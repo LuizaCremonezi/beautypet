@@ -35,139 +35,172 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Guarda o ID do agendamento criado ou selecionado para edição, status ou exclusão.
     $agendamentoId = inteiroOuNull($_POST['agendamento_id'] ?? null);
 
-    // Valida a existência do identificador antes de alterar ou excluir um agendamento.
-    if ($agendamentoId === null) {
-        // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-        $mensagem = 'A solicitação selecionada é inválida.';
-        // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
-        $tipoMensagem = 'error';
-    // Caso a condição anterior não tenha sido atendida, testa esta alternativa.
-    } elseif (in_array($acao, ['confirmar', 'recusar', 'cancelar'], true)) {
-        // Guarda o status solicitado e permite validar se a transição é aceita antes de atualizar o banco.
-        $novoStatus = match ($acao) {
-            'confirmar' => 'CONFIRMADO',
-            'recusar'   => 'RECUSADO',
-            'cancelar'  => 'CANCELADO',
-        };
-
-        // Prepara a atualização do registro correspondente em "agendamentos" com os novos dados.
-        $stmt = $pdo->prepare(
-            "UPDATE agendamentos
-             SET status = :status,
-                 respondido_por = :usuario_id,
-                 respondido_em = CURRENT_TIMESTAMP
-             WHERE id = :id
-               AND origem = 'MOBILE'"
-        );
-
-        // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-        $stmt->execute([
-            ':status'     => $novoStatus,
-            ':usuario_id' => $usuarioId,
-            ':id'         => $agendamentoId,
-        ]);
-
-        // Armazena em "abaRetorno" o valor necessário para as próximas etapas deste fluxo.
-        $abaRetorno = $acao === 'cancelar'
-            ? 'confirmadas'
-            : 'pendentes';
-
-        // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
-        header(
-            'Location: solicitacoes-agendamento.php?aba='
-            . $abaRetorno
-            . '&atualizado=1'
-        );
-        // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
-        exit;
-    // Caso a condição anterior não tenha sido atendida, testa esta alternativa.
-    } elseif ($acao === 'reagendar') {
-        // Armazena a data "data" usada nas validações e consultas desta página.
-        $data = (string) ($_POST['data'] ?? '');
-        // Armazena o horário "hora" utilizado na regra de agendamento/atendimento.
-        $hora = (string) ($_POST['hora'] ?? '');
-
-        // Verifica a condição abaixo antes de executar este bloco.
-        if (!dataSqlValida($data) || !horaSqlValida($hora)) {
+    // HEURÍSTICA 9: antes não havia try/catch nesta página; uma falha do banco virava erro fatal.
+    try {
+        // Valida a existência do identificador antes de alterar ou excluir um agendamento.
+        if ($agendamentoId === null) {
             // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-            $mensagem = 'Informe uma nova data e um novo horário válidos.';
+            $mensagem = 'Não foi possível identificar a solicitação. Atualize a página e tente novamente.';
             // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
             $tipoMensagem = 'error';
-        // Quando nenhuma das condições anteriores for atendida, executa este fluxo alternativo.
-        } else {
-            // Prepara uma consulta em "agendamentos" para carregar os dados necessários a esta etapa.
+        // Caso a condição anterior não tenha sido atendida, testa esta alternativa.
+        } elseif (in_array($acao, ['confirmar', 'recusar', 'cancelar'], true)) {
+            // Guarda o status solicitado e permite validar se a transição é aceita antes de atualizar o banco.
+            $novoStatus = match ($acao) {
+                'confirmar' => 'CONFIRMADO',
+                'recusar'   => 'RECUSADO',
+                'cancelar'  => 'CANCELADO',
+            };
+
+            // Prepara a atualização do registro correspondente em "agendamentos" com os novos dados.
             $stmt = $pdo->prepare(
-                "SELECT data_hora_inicio, data_hora_fim
-                 FROM agendamentos
+                "UPDATE agendamentos
+                 SET status = :status,
+                     respondido_por = :usuario_id,
+                     respondido_em = CURRENT_TIMESTAMP
                  WHERE id = :id
                    AND origem = 'MOBILE'"
             );
+
             // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-            $stmt->execute([':id' => $agendamentoId]);
-            // Obtém a próxima linha retornada pela consulta como um registro associativo.
-            $atual = $stmt->fetch();
+            $stmt->execute([
+                ':status'     => $novoStatus,
+                ':usuario_id' => $usuarioId,
+                ':id'         => $agendamentoId,
+            ]);
+
+            // HEURÍSTICA 9: avisa se a solicitação não existe mais (ex.: removida pelo cliente no app).
+            if ($stmt->rowCount() === 0) {
+                throw new RuntimeException('Essa solicitação não foi encontrada. Ela pode ter sido removida; atualize a página.');
+            }
+
+            // Armazena em "abaRetorno" o valor necessário para as próximas etapas deste fluxo.
+            $abaRetorno = $acao === 'cancelar'
+                ? 'confirmadas'
+                : 'pendentes';
+
+            // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
+            header(
+                'Location: solicitacoes-agendamento.php?aba='
+                . $abaRetorno
+                . '&atualizado=1'
+            );
+            // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
+            exit;
+        // Caso a condição anterior não tenha sido atendida, testa esta alternativa.
+        } elseif ($acao === 'reagendar') {
+            // Armazena a data "data" usada nas validações e consultas desta página.
+            $data = (string) ($_POST['data'] ?? '');
+            // Armazena o horário "hora" utilizado na regra de agendamento/atendimento.
+            $hora = (string) ($_POST['hora'] ?? '');
 
             // Verifica a condição abaixo antes de executar este bloco.
-            if (!$atual) {
+            if (!dataSqlValida($data) || !horaSqlValida($hora)) {
                 // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-                $mensagem = 'A solicitação não foi encontrada.';
+                $mensagem = 'Informe uma nova data e um novo horário válidos.';
                 // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
+                $tipoMensagem = 'error';
+            // HEURÍSTICA 9: não deixa reagendar para um horário que já passou.
+            } elseif (dataHoraJaPassou($data, $hora)) {
+                $mensagem = 'O novo horário já passou. Escolha uma data e horário a partir de agora.';
                 $tipoMensagem = 'error';
             // Quando nenhuma das condições anteriores for atendida, executa este fluxo alternativo.
             } else {
-                // Armazena em "novoInicio" o valor necessário para as próximas etapas deste fluxo.
-                $novoInicio = new DateTime($data . ' ' . $hora . ':00');
-                // Armazena em "novoFim" o valor necessário para as próximas etapas deste fluxo.
-                $novoFim = null;
-
-                // Verifica a condição abaixo antes de executar este bloco.
-                if (!empty($atual['data_hora_fim'])) {
-                    // Armazena em "inicioAnterior" o valor necessário para as próximas etapas deste fluxo.
-                    $inicioAnterior = new DateTime($atual['data_hora_inicio']);
-                    // Armazena em "fimAnterior" o valor necessário para as próximas etapas deste fluxo.
-                    $fimAnterior = new DateTime($atual['data_hora_fim']);
-                    // Armazena em "duracao" o valor necessário para as próximas etapas deste fluxo.
-                    $duracao = max(
-                        0,
-                        $fimAnterior->getTimestamp()
-                        - $inicioAnterior->getTimestamp()
-                    );
-
-                    // Armazena em "novoFim" o valor necessário para as próximas etapas deste fluxo.
-                    $novoFim = (clone $novoInicio)
-                        ->modify('+' . $duracao . ' seconds')
-                        ->format('Y-m-d H:i:s');
-                }
-
-                // Prepara a atualização do registro correspondente em "agendamentos" com os novos dados.
+                // Prepara uma consulta em "agendamentos" para carregar os dados necessários a esta etapa.
                 $stmt = $pdo->prepare(
-                    "UPDATE agendamentos
-                     SET data_hora_inicio = :inicio,
-                         data_hora_fim = :fim,
-                         status = 'CONFIRMADO',
-                         respondido_por = :usuario_id,
-                         respondido_em = CURRENT_TIMESTAMP
+                    "SELECT pet_id, data_hora_inicio, data_hora_fim
+                     FROM agendamentos
                      WHERE id = :id
                        AND origem = 'MOBILE'"
                 );
-
                 // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-                $stmt->execute([
-                    ':inicio'     => $novoInicio->format('Y-m-d H:i:s'),
-                    ':fim'        => $novoFim,
-                    ':usuario_id' => $usuarioId,
-                    ':id'         => $agendamentoId,
-                ]);
+                $stmt->execute([':id' => $agendamentoId]);
+                // Obtém a próxima linha retornada pela consulta como um registro associativo.
+                $atual = $stmt->fetch();
 
-                // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
-                header(
-                    'Location: solicitacoes-agendamento.php'
-                    . '?aba=confirmadas&reagendado=1'
-                );
-                // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
-                exit;
+                // Verifica a condição abaixo antes de executar este bloco.
+                if (!$atual) {
+                    // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
+                    $mensagem = 'A solicitação não foi encontrada.';
+                    // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
+                    $tipoMensagem = 'error';
+                // Quando nenhuma das condições anteriores for atendida, executa este fluxo alternativo.
+                } else {
+                    // Armazena em "novoInicio" o valor necessário para as próximas etapas deste fluxo.
+                    $novoInicio = new DateTime($data . ' ' . $hora . ':00');
+                    // Armazena em "novoFim" o valor necessário para as próximas etapas deste fluxo.
+                    $novoFim = null;
+
+                    // Verifica a condição abaixo antes de executar este bloco.
+                    if (!empty($atual['data_hora_fim'])) {
+                        // Armazena em "inicioAnterior" o valor necessário para as próximas etapas deste fluxo.
+                        $inicioAnterior = new DateTime($atual['data_hora_inicio']);
+                        // Armazena em "fimAnterior" o valor necessário para as próximas etapas deste fluxo.
+                        $fimAnterior = new DateTime($atual['data_hora_fim']);
+                        // Armazena em "duracao" o valor necessário para as próximas etapas deste fluxo.
+                        $duracao = max(
+                            0,
+                            $fimAnterior->getTimestamp()
+                            - $inicioAnterior->getTimestamp()
+                        );
+
+                        // Armazena em "novoFim" o valor necessário para as próximas etapas deste fluxo.
+                        $novoFim = (clone $novoInicio)
+                            ->modify('+' . $duracao . ' seconds')
+                            ->format('Y-m-d H:i:s');
+                    }
+
+                    // HEURÍSTICA 9: verifica se o pet já tem outro agendamento no novo horário.
+                    $horarioConflito = conflitoHorarioPet(
+                        $pdo,
+                        (int) $atual['pet_id'],
+                        $novoInicio->format('Y-m-d H:i:s'),
+                        $novoFim,
+                        $agendamentoId
+                    );
+
+                    if ($horarioConflito !== null) {
+                        throw new RuntimeException('Este pet já tem um agendamento às ' . $horarioConflito . ' nesse dia. Escolha outro horário para reagendar.');
+                    }
+
+                    // Prepara a atualização do registro correspondente em "agendamentos" com os novos dados.
+                    $stmt = $pdo->prepare(
+                        "UPDATE agendamentos
+                         SET data_hora_inicio = :inicio,
+                             data_hora_fim = :fim,
+                             status = 'CONFIRMADO',
+                             respondido_por = :usuario_id,
+                             respondido_em = CURRENT_TIMESTAMP
+                         WHERE id = :id
+                           AND origem = 'MOBILE'"
+                    );
+
+                    // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
+                    $stmt->execute([
+                        ':inicio'     => $novoInicio->format('Y-m-d H:i:s'),
+                        ':fim'        => $novoFim,
+                        ':usuario_id' => $usuarioId,
+                        ':id'         => $agendamentoId,
+                    ]);
+
+                    // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.
+                    header(
+                        'Location: solicitacoes-agendamento.php'
+                        . '?aba=confirmadas&reagendado=1'
+                    );
+                    // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
+                    exit;
+                }
             }
         }
+    } catch (Throwable $erro) {
+        if (!erroDeRegra($erro)) {
+            error_log('[BeautyPet] solicitacoes: ' . $erro->getMessage());
+        }
+        $mensagem = erroDeRegra($erro)
+            ? $erro->getMessage()
+            : 'Não foi possível atualizar a solicitação agora. Nada foi alterado: confira a internet e tente novamente.';
+        $tipoMensagem = 'error';
     }
 }
 
@@ -298,7 +331,7 @@ require __DIR__ . '/../includes/topo.php';
     </div>
 
     <?php if ($mensagem !== ''): ?>
-        <div class="message <?= escapar($tipoMensagem) ?>">
+        <div class="message <?= escapar($tipoMensagem) ?>" role="<?= $tipoMensagem === 'error' ? 'alert' : 'status' ?>">
             <?= escapar($mensagem) ?>
         </div>
     <?php endif; ?>
@@ -308,7 +341,7 @@ require __DIR__ . '/../includes/topo.php';
         // Armazena a data "dataHoraEditar" usada nas validações e consultas desta página.
         $dataHoraEditar = new DateTime($solicitacaoEditar['data_hora_inicio']);
         ?>
-        <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
+<!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
         <form class="reschedule-card" method="post"
             action="solicitacoes-agendamento.php?aba=<?= escapar($aba) ?>">
             <!-- Campo "acao" utilizado para enviar esta informação no formulário. -->
@@ -317,38 +350,40 @@ require __DIR__ . '/../includes/topo.php';
             <input type="hidden" name="agendamento_id"
                 value="<?= (int) $solicitacaoEditar['id'] ?>">
 
-            <div>
+            <div class="reschedule-header">
                 <h2>Reagendar <?= escapar($solicitacaoEditar['pet']) ?></h2>
                 <small>Tutor: <?= escapar($solicitacaoEditar['tutor']) ?></small>
             </div>
 
-            <div class="field">
-                <!-- Rótulo do campo "Nova data", indicando ao usuário qual informação deve ser preenchida. -->
-                <label for="novaData">Nova data</label>
-                <!-- Campo "data" utilizado para enviar esta informação no formulário. -->
-                <input id="novaData" name="data" type="date"
-                    value="<?= escapar($dataHoraEditar->format('Y-m-d')) ?>"
-                    required>
+            <div class="reschedule-row">
+                <div class="field">
+                    <label for="novaData">Nova data</label>
+                    <?php /* HEURÍSTICA 9: min=hoje impede escolher data passada no calendário. */ ?>
+                    <input id="novaData" name="data" type="date" min="<?= date('Y-m-d') ?>"
+                        value="<?= escapar($dataHoraEditar->format('Y-m-d')) ?>"
+                        required>
+                </div>
+
+                <div class="field">
+                    <label for="novaHora">Novo horário</label>
+                    <input id="novaHora" name="hora" type="time"
+                        value="<?= escapar($dataHoraEditar->format('H:i')) ?>"
+                        required>
+                </div>
             </div>
 
-            <div class="field">
-                <!-- Rótulo do campo "Novo horário", indicando ao usuário qual informação deve ser preenchida. -->
-                <label for="novaHora">Novo horário</label>
-                <!-- Campo "hora" utilizado para enviar esta informação no formulário. -->
-                <input id="novaHora" name="hora" type="time"
-                    value="<?= escapar($dataHoraEditar->format('H:i')) ?>"
-                    required>
+            <div class="reschedule-actions">
+                <a class="secondary-action-button"
+                    href="solicitacoes-agendamento.php?aba=<?= escapar($aba) ?>">
+                    Cancelar
+                </a>
+
+                <button class="primary-action-button" type="submit">
+                    Salvar alterações
+                </button>
             </div>
-
-            <button class="primary-action-button" type="submit">
-                Salvar e confirmar
-            </button>
-
-            <a class="secondary-action-button"
-                href="solicitacoes-agendamento.php?aba=<?= escapar($aba) ?>">
-                Cancelar
-            </a>
         </form>
+
     <?php endif; ?>
 
     <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
@@ -413,7 +448,6 @@ require __DIR__ . '/../includes/topo.php';
                                     <input type="hidden" name="agendamento_id"
                                         value="<?= (int) $item['id'] ?>">
                                     <button class="request-button confirm" type="submit">
-                                        <i class="fa-solid fa-check"></i>
                                         Confirmar
                                     </button>
                                 </form>
@@ -440,12 +474,10 @@ require __DIR__ . '/../includes/topo.php';
                             </div>
                         <?php else: ?>
                             <div class="request-actions">
-                                <span class="status-badge success">Confirmado</span>
-
                                 <a class="request-button reschedule"
                                     href="solicitacoes-agendamento.php?aba=confirmadas&editar=<?= (int) $item['id'] ?>">
-                                    <i class="fa-solid fa-pen"></i>
-                                    Editar
+                                    <i class="fa-regular fa-calendar"></i>
+                                    Reagendar
                                 </a>
 
                                 <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
@@ -458,7 +490,7 @@ require __DIR__ . '/../includes/topo.php';
                                         value="<?= (int) $item['id'] ?>">
                                     <button class="icon-action-button danger"
                                         type="submit" title="Cancelar">
-                                        <i class="fa-solid fa-xmark"></i>
+                                        <i class="fa-solid fa-trash"></i>
                                     </button>
                                 </form>
                             </div>

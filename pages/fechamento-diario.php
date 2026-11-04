@@ -47,6 +47,37 @@ function valorFechamento(mixed $valor): float
 }
 
 /**
+ * HEURÍSTICA 9: valorFechamento() troca negativo/texto por R$ 0 sem avisar.
+ * Esta função procura, antes de salvar, qualquer campo de valor inválido no formulário
+ * para que o usuário seja avisado em vez de ter o valor zerado em silêncio.
+ */
+function campoValorInvalidoFechamento(array $post): bool
+{
+    foreach ($post as $chave => $valor) {
+        if (is_array($valor)) {
+            if (campoValorInvalidoFechamento($valor)) {
+                return true;
+            }
+            continue;
+        }
+
+        $ehCampoDeValor = preg_match('/^(valor|pagamento_|credito_)/', (string) $chave) === 1;
+
+        if (!$ehCampoDeValor || $valor === null || trim((string) $valor) === '') {
+            continue;
+        }
+
+        $numero = str_replace(',', '.', trim((string) $valor));
+
+        if (!is_numeric($numero) || (float) $numero < 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Agrupa o serviço em uma categoria resumida usada nas colunas e totais do fechamento.
  * Mantém esta regra isolada para evitar repetição e facilitar manutenção/testes.
  */
@@ -834,8 +865,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Identifica qual ação o formulário solicitou para direcionar o processamento correto.
     $acao = (string) ($_POST['acao'] ?? '');
 
+    // HEURÍSTICA 9: bloqueia valores negativos ou com letras antes de qualquer gravação.
+    if ($acao !== 'reabrir_fechamento' && campoValorInvalidoFechamento($_POST)) {
+        $mensagem = 'Há um valor inválido no formulário. Os valores devem ser números maiores ou iguais a zero (ex.: 35,90). Corrija e salve novamente.';
+        $tipoMensagem = 'error';
+        $acao = '';
+    }
+
     // Verifica se o fechamento já foi encerrado para impedir alterações que exigem o caixa aberto.
-    if ($fechamentoFechado && !in_array($acao, ['reabrir_fechamento'], true)) {
+    if ($fechamentoFechado && !in_array($acao, ['reabrir_fechamento', ''], true)) {
         // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
         $mensagem = 'Esse fechamento já foi finalizado. Reabra o dia para fazer alterações.';
         // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
@@ -1482,7 +1520,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-                $mensagem = $erro instanceof RuntimeException
+                $mensagem = erroDeRegra($erro)
                     ? $erro->getMessage()
                     : 'Não foi possível salvar o registro.';
                 // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
@@ -1680,7 +1718,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-                $mensagem = $erro instanceof RuntimeException
+                $mensagem = erroDeRegra($erro)
                     ? $erro->getMessage()
                     : 'Não foi possível atualizar o pagamento.';
                 // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
@@ -2002,8 +2040,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->rollBack();
             }
 
-            // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-            $mensagem = 'Não foi possível finalizar o fechamento.';
+            // HEURÍSTICA 9: registra a causa e garante ao usuário que nada foi gravado.
+            error_log('[BeautyPet] finalizar fechamento: ' . $erro->getMessage());
+            $mensagem = erroDeRegra($erro)
+                ? $erro->getMessage()
+                : 'Não foi possível finalizar o fechamento. Nenhum dado foi alterado: confira a internet e tente de novo.';
             // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
             $tipoMensagem = 'error';
         }
@@ -2050,15 +2091,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // Encerra a execução desta requisição após o redirecionamento ou resposta enviada.
             exit;
         // Captura uma falha ocorrida no bloco anterior para desfazer operações e exibir uma mensagem controlada.
-        } catch (Throwable) {
+        } catch (Throwable $erro) {
             // Confere se existe uma transação aberta antes de tentar desfazê-la.
             if ($pdo->inTransaction()) {
                 // Desfaz as alterações da transação atual porque alguma etapa falhou.
                 $pdo->rollBack();
             }
 
-            // Inicializa a mensagem de retorno que será mostrada ao usuário após validações ou operações.
-            $mensagem = 'Não foi possível reabrir o fechamento.';
+            // HEURÍSTICA 9: registra a causa e garante ao usuário que nada foi alterado.
+            error_log('[BeautyPet] reabrir fechamento: ' . $erro->getMessage());
+            $mensagem = 'Não foi possível reabrir o fechamento. O dia continua fechado: tente novamente em instantes.';
             // Define a classe visual da mensagem de retorno, normalmente sucesso ou erro.
             $tipoMensagem = 'error';
         }
@@ -2392,49 +2434,38 @@ require __DIR__ . '/../includes/topo.php';
         </div>
 
         <div class="daily-close-status-area">
-            <span class="daily-close-status status-<?= strtolower(escapar((string) $fechamento['status'])) ?>">
+            <span class="daily-close-status general-status">
                 <i class="fa-solid fa-circle"></i>
                 <?= escapar((string) $fechamento['status']) ?>
             </span>
 
-            <?php if ($fechamentoFechado && $administrador): ?>
-                <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
-                <form method="post" action="fechamento-diario.php?data=<?= escapar($dataSelecionada) ?>">
-                    <!-- Campo "acao" utilizado para enviar esta informação no formulário. -->
-                    <input type="hidden" name="acao" value="reabrir_fechamento">
-                    <button class="daily-ghost-button" type="submit">
-                        <i class="fa-solid fa-lock-open"></i>
-                        Reabrir dia
-                    </button>
-                </form>
-            <?php endif; ?>
         </div>
     </div>
-
     <?php if ($mensagem !== ''): ?>
-        <div class="message <?= escapar($tipoMensagem) ?> daily-close-message">
+        <div class="message <?= escapar($tipoMensagem) ?> daily-close-message" role="<?= $tipoMensagem === 'error' ? 'alert' : 'status' ?>">
             <?= escapar($mensagem) ?>
         </div>
     <?php endif; ?>
 
-    <div class="daily-date-toolbar">
-        <div class="daily-date-nav">
-            <a href="fechamento-diario.php?data=<?= escapar($dataAnterior) ?>" aria-label="Dia anterior">
-                <i class="fa-solid fa-chevron-left"></i>
-            </a>
-            <a class="daily-today-button" href="fechamento-diario.php?data=<?= escapar(date('Y-m-d')) ?>">Hoje</a>
-            <a href="fechamento-diario.php?data=<?= escapar($dataSeguinte) ?>" aria-label="Dia seguinte">
-                <i class="fa-solid fa-chevron-right"></i>
-            </a>
-        </div>
+<div class="daily-date-toolbar">
+        <!-- 1. Botão Hoje -->
+        <a class="daily-today-button" href="fechamento-diario.php?data=<?= escapar(date('Y-m-d')) ?>">Hoje</a>
 
-        <!-- Formulário responsável por enviar os dados desta ação para processamento no PHP. -->
+        <!-- 2. Seta Esquerda -->
+        <a class="daily-date-arrow" href="fechamento-diario.php?data=<?= escapar($dataAnterior) ?>" aria-label="Dia anterior">
+            <i class="fa-solid fa-chevron-left"></i>
+        </a>
+
+        <!-- 3. Calendário (Submete automaticamente ao escolher a data) -->
         <form method="get" action="fechamento-diario.php" class="daily-date-form">
-            <!-- Rótulo do campo "Data do fechamento", indicando ao usuário qual informação deve ser preenchida. -->
             <label for="dataFechamento">Data do fechamento</label>
-            <!-- Campo "data" utilizado para enviar esta informação no formulário. -->
             <input id="dataFechamento" name="data" type="date" value="<?= escapar($dataSelecionada) ?>" onchange="this.form.submit()">
         </form>
+
+        <!-- 4. Seta Direita -->
+        <a class="daily-date-arrow" href="fechamento-diario.php?data=<?= escapar($dataSeguinte) ?>" aria-label="Dia seguinte">
+            <i class="fa-solid fa-chevron-right"></i>
+        </a>
 
         <strong class="daily-date-title"><?= escapar(formatarData($dataSelecionada)) ?></strong>
     </div>
@@ -2448,9 +2479,9 @@ require __DIR__ . '/../includes/topo.php';
             </div>
 
             <div class="daily-sheet-actions">
-                <button class="daily-primary-button" type="button" data-open-daily-modal="launch" <?= $fechamentoFechado ? 'disabled' : '' ?>>
+                <button class="daily-dashed-add-button" type="button" data-open-daily-modal="launch" <?= $fechamentoFechado ? 'disabled' : '' ?>>
                     <i class="fa-solid fa-plus"></i>
-                    Novo lançamento
+                    Adicionar novo lançamento
                 </button>
             </div>
         </div>
@@ -2617,14 +2648,14 @@ require __DIR__ . '/../includes/topo.php';
     </section>
 
     <div class="daily-after-sheet-title">
-        <span>Resumo do dia</span>
+        <span>Resumo do dia </span>
         <small>Os totais ficam abaixo da planilha para deixar o fechamento mais limpo.</small>
     </div>
 
     <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
     <section class="daily-summary-grid">
         <article class="daily-summary-card emphasis">
-            <span>Comercializado</span>
+            <span>Total Comercializado</span>
             <strong><?= formatarMoeda($resumo['total_comercializado'] ?? 0) ?></strong>
             <small>Serviços + adicionais</small>
         </article>
@@ -2681,7 +2712,7 @@ require __DIR__ . '/../includes/topo.php';
             <strong><?= formatarMoeda($resumoPagamentos['cartao'] ?? 0) ?></strong>
         </div>
         <button class="daily-opening-box" type="button" data-open-daily-modal="opening" <?= $fechamentoFechado ? 'disabled' : '' ?>>
-            <span>Abertura do caixa <i class="fa-solid fa-pen"></i></span>
+            <span>Abertura do caixa</span>
             <strong><?= formatarMoeda($fechamento['valor_abertura_caixa'] ?? 0) ?></strong>
         </button>
     </section>
@@ -2753,17 +2784,27 @@ require __DIR__ . '/../includes/topo.php';
             </div>
         </div>
 
-        <?php if (!$fechamentoFechado): ?>
-            <button class="daily-finish-button" type="button" data-open-daily-modal="finish">
-                <i class="fa-solid fa-check"></i>
-                Finalizar dia
-            </button>
-        <?php else: ?>
-            <div class="daily-closed-label">
-                <i class="fa-solid fa-lock"></i>
-                Fechado em <?= escapar(formatarDataHoraAgenda($fechamento['fechado_em'])) ?>
-            </div>
-        <?php endif; ?>
+<div class="daily-cash-actions-area">
+            <?php if (!$fechamentoFechado): ?>
+                <button class="daily-finish-button" type="button" data-open-daily-modal="finish">
+                    Finalizar dia
+                </button>
+            <?php else: ?>
+                <div class="daily-closed-label">
+                    <i class="fa-solid fa-lock"></i>
+                    Fechado em <?= escapar(formatarDataHoraAgenda($fechamento['fechado_em'])) ?>
+                </div>
+
+                <?php if ($administrador): ?>
+                    <form method="post" action="fechamento-diario.php?data=<?= escapar($dataSelecionada) ?>">
+                        <input type="hidden" name="acao" value="reabrir_fechamento">
+                        <button class="daily-ghost-button daily-reopen-button" type="submit">
+                            Reabrir dia
+                        </button>
+                    </form>
+                <?php endif; ?>
+            <?php endif; ?>
+        </div>
     </section>
 </div>
 
@@ -2886,8 +2927,7 @@ require __DIR__ . '/../includes/topo.php';
             <div class="daily-modal-footer">
                 <button type="button" class="daily-cancel-button" data-close-daily-modal>Cancelar</button>
                 <button type="submit" class="daily-primary-button">
-                    <i class="fa-solid fa-check"></i>
-                    <span id="dailySaveRecordText">Salvar registro</span>
+                    <span id="dailySaveRecordText">Salvar</span>
                 </button>
             </div>
         </form>
@@ -2962,7 +3002,7 @@ require __DIR__ . '/../includes/topo.php';
             <!-- Bloco visual "daily-modal-footer" que organiza esta parte da interface. -->
             <div class="daily-modal-footer">
                 <button type="button" class="daily-cancel-button" data-close-daily-modal>Cancelar</button>
-                <button type="submit" class="daily-primary-button"><i class="fa-solid fa-check"></i> Salvar pagamento</button>
+                <button type="submit" class="daily-primary-button"> Salvar</button>
             </div>
         </form>
     </div>
@@ -3046,7 +3086,7 @@ require __DIR__ . '/../includes/topo.php';
                 <div class="daily-final-warning"><i class="fa-solid fa-lock"></i><span>Depois de finalizar, as linhas ficam bloqueadas. Qualquer valor ainda não pago será lançado automaticamente como débito na ficha do tutor. Administradores podem reabrir o dia.</span></div>
             </div>
             <!-- Bloco visual "daily-modal-footer" que organiza esta parte da interface. -->
-            <div class="daily-modal-footer"><button type="button" class="daily-cancel-button" data-close-daily-modal>Cancelar</button><button type="submit" class="daily-finish-button"><i class="fa-solid fa-check"></i> Finalizar fechamento</button></div>
+            <div class="daily-modal-footer"><button type="button" class="daily-cancel-button" data-close-daily-modal>Cancelar</button><button type="submit" class="daily-finish-button">Finalizar fechamento</button></div>
         </form>
     </div>
 </div>
@@ -3748,7 +3788,7 @@ require __DIR__ . '/../includes/topo.php';
         recordKey.value = '';
         launchKicker.textContent = 'Novo registro';
         launchTitle.textContent = 'Adicionar linha ao fechamento';
-        saveRecordText.textContent = 'Salvar registro';
+        saveRecordText.textContent = 'Salvar';
         setPet('', '');
         servicesList.innerHTML = '';
         document.querySelector('#dailyPaymentCash').value = '0.00';
@@ -3775,6 +3815,8 @@ require __DIR__ . '/../includes/topo.php';
             if (!key) return;
 
             button.disabled = true;
+            // [BP-CARREGANDO] Bolinha no botão enquanto o registro é buscado (internet lenta). Veja assets/js/carregamento-global.js.
+            window.BPCarregando?.iniciar({ botao: button, mensagem: 'Abrindo o registro...', bloquearTela: false });
 
             try {
                 // Armazena em "response" um valor usado pela lógica executada no navegador.
@@ -3791,7 +3833,7 @@ require __DIR__ . '/../includes/topo.php';
                 recordKey.value = key;
                 launchKicker.textContent = 'Editar linha completa';
                 launchTitle.textContent = `Editar ${data.pet_label || 'registro'}`;
-                saveRecordText.textContent = 'Salvar alterações';
+                saveRecordText.textContent = 'Salvar';
                 setPet(data.pet_id, data.pet_label);
                 servicesList.innerHTML = '';
 
@@ -3812,9 +3854,11 @@ require __DIR__ . '/../includes/topo.php';
                 recalculate();
                 openModal('launch');
             } catch (error) {
-                alert('Não foi possível abrir esta linha para edição.');
+                // HEURÍSTICA 9: diz a causa provável e o que fazer.
+                alert('Não foi possível abrir esta linha para edição. Verifique a conexão e atualize a página (F5) antes de tentar de novo.');
             } finally {
                 button.disabled = false;
+                window.BPCarregando?.parar(button);
             }
         });
     });
@@ -3973,6 +4017,9 @@ const setupPetSearchPicker = () => {
                 resultsBox.hidden = false;
             } catch (error) {
                 console.error('Erro ao consultar pets:', error);
+                // HEURÍSTICA 9: antes o erro só ia para o console; agora o usuário vê o que aconteceu.
+                resultsBox.innerHTML = '<div class="search-picker-empty" role="alert" style="padding: 8px 12px; color: #b91c1c;">Não foi possível buscar pets agora. Verifique a conexão e digite novamente.</div>';
+                resultsBox.hidden = false;
             }
         }, 300);
     });

@@ -3,23 +3,21 @@
 declare(strict_types=1);
 
 /**
- * Carrega variáveis de um arquivo .env.
+ * Carrega variáveis de um arquivo .env quando ele existir.
  *
- * Em produção, como no Render, o arquivo .env pode não existir,
- * pois as variáveis são configuradas diretamente no ambiente.
+ * No ambiente local (XAMPP), o arquivo config/.env pode ser usado normalmente.
+ * No Render, o arquivo físico não é necessário: as variáveis são cadastradas
+ * no painel do serviço e ficam disponíveis por getenv().
  */
 function carregarEnv(string $arquivo): void
 {
-    // No Render, o .env não existe fisicamente.
-    // Nesse caso, usamos as variáveis configuradas no painel.
+    // Em produção o .env pode não existir; nesse caso usamos as variáveis
+    // fornecidas pelo próprio servidor (por exemplo, pelo Render).
     if (!is_file($arquivo)) {
         return;
     }
 
-    $linhas = file(
-        $arquivo,
-        FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES
-    );
+    $linhas = file($arquivo, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
     if ($linhas === false) {
         return;
@@ -33,7 +31,7 @@ function carregarEnv(string $arquivo): void
             continue;
         }
 
-        // Ignora linhas que não possuem "=".
+        // Ignora linhas que não seguem o formato NOME=VALOR.
         if (!str_contains($linha, '=')) {
             continue;
         }
@@ -47,31 +45,26 @@ function carregarEnv(string $arquivo): void
             continue;
         }
 
-        // Remove aspas usadas no .env.
-        if (
-            strlen($valor) >= 2 &&
-            (
-                ($valor[0] === '"' && $valor[strlen($valor) - 1] === '"') ||
-                ($valor[0] === "'" && $valor[strlen($valor) - 1] === "'")
-            )
-        ) {
-            $valor = substr($valor, 1, -1);
+        // Variáveis definidas pelo servidor têm prioridade sobre o .env local.
+        $valorDoAmbiente = getenv($nome);
+        if ($valorDoAmbiente !== false && $valorDoAmbiente !== '') {
+            $_ENV[$nome] = $valorDoAmbiente;
+            $_SERVER[$nome] = $valorDoAmbiente;
+            continue;
         }
 
-        /*
-         * Variáveis definidas pelo servidor têm prioridade.
-         * Assim, o Render nunca é sobrescrito por um eventual .env.
-         */
-        $valorExistente = getenv($nome);
+        // Permite valores entre aspas simples ou duplas no arquivo .env.
+        if (strlen($valor) >= 2) {
+            $primeiro = $valor[0];
+            $ultimo = $valor[strlen($valor) - 1];
 
-        if ($valorExistente !== false && $valorExistente !== '') {
-            $_ENV[$nome] = $valorExistente;
-            $_SERVER[$nome] = $valorExistente;
-            continue;
+            if (($primeiro === '"' && $ultimo === '"') || ($primeiro === "'" && $ultimo === "'")) {
+                $valor = substr($valor, 1, -1);
+            }
         }
 
         $_ENV[$nome] = $valor;
         $_SERVER[$nome] = $valor;
-        putenv("{$nome}={$valor}");
+        putenv($nome . '=' . $valor);
     }
 }
