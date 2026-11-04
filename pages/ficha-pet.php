@@ -14,8 +14,9 @@ if (!$id) {
     exit;
 }
 
-// Prepara uma consulta em "pets" para carregar os dados cadastrais e financeiros do pet.
-$sqlPet = '
+// Consulta otimizada do pet: saldo do tutor e gasto do pet são calculados
+// somente para os IDs envolvidos nesta ficha.
+$sqlPet = <<<'SQL'
     SELECT
         p.*,
         c.nome AS tutor,
@@ -26,25 +27,46 @@ $sqlPet = '
         COALESCE(s.saldo_debito, 0.00)  AS saldo_debito_tutor,
         COALESCE(g.total_gasto, 0.00)   AS total_gasto
     FROM pets p
-    JOIN clientes c
-        ON c.id = p.cliente_id
-    JOIN especies e
-        ON e.id = p.especie_id
-    LEFT JOIN racas r
-        ON r.id = p.raca_id
-    LEFT JOIN vw_saldo_cliente s
-        ON s.cliente_id = c.id
-    LEFT JOIN (
+    JOIN clientes c ON c.id = p.cliente_id
+    JOIN especies e ON e.id = p.especie_id
+    LEFT JOIN racas r ON r.id = p.raca_id
+
+    LEFT JOIN LATERAL (
         SELECT
-            pet_id,
-            SUM(valor_total_lancamento) AS total_gasto
-        FROM vw_total_lancamento
-        GROUP BY pet_id
-    ) g
-        ON g.pet_id = p.id
+            COALESCE(SUM(
+                CASE
+                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                    ELSE 0
+                END
+            ), 0.00) AS saldo_credito,
+            COALESCE(SUM(
+                CASE
+                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                    ELSE 0
+                END
+            ), 0.00) AS saldo_debito
+        FROM movimentacoes_cliente m
+        WHERE m.cliente_id = c.id
+    ) s ON TRUE
+
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(
+            l.valor_servico
+            + COALESCE((
+                SELECT SUM(la.valor)
+                FROM lancamento_adicionais la
+                WHERE la.lancamento_diario_id = l.id
+            ), 0)
+        ), 0) AS total_gasto
+        FROM lancamentos_diarios l
+        WHERE l.pet_id = p.id
+    ) g ON TRUE
+
     WHERE p.id = :id
       AND p.ativo = TRUE
-';
+SQL;
 
 $stmt = $pdo->prepare($sqlPet);
 $stmt->execute([':id' => $id]);
@@ -55,23 +77,32 @@ if (!$pet) {
     exit;
 }
 
-// Carrega os pacotes ativos e com créditos restantes do pet.
-$sqlPacotes = '
+// Carrega somente os pacotes deste pet e calcula os créditos utilizados diretamente.
+$sqlPacotes = <<<'SQL'
     SELECT
-        pet_pacote_id,
-        pacote,
-        data_compra,
-        data_validade,
-        creditos_totais,
-        creditos_utilizados,
-        creditos_restantes,
-        status
-    FROM vw_saldo_pacotes
-    WHERE pet_id = :pet_id
-      AND status = \'ATIVO\'
-      AND creditos_restantes > 0
-    ORDER BY data_compra DESC
-';
+        pp.id AS pet_pacote_id,
+        pa.nome AS pacote,
+        pp.data_compra,
+        pp.data_validade,
+        pp.quantidade_creditos AS creditos_totais,
+        COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_utilizados,
+        pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_restantes,
+        pp.status
+    FROM pet_pacotes pp
+    JOIN pacotes pa ON pa.id = pp.pacote_id
+    LEFT JOIN lancamentos_diarios l ON l.pet_pacote_id = pp.id
+    WHERE pp.pet_id = :pet_id
+      AND pp.status = 'ATIVO'
+    GROUP BY
+        pp.id,
+        pa.nome,
+        pp.data_compra,
+        pp.data_validade,
+        pp.quantidade_creditos,
+        pp.status
+    HAVING pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) > 0
+    ORDER BY pp.data_compra DESC
+SQL;
 
 $stmt = $pdo->prepare($sqlPacotes);
 $stmt->execute([':pet_id' => $id]);
@@ -91,7 +122,7 @@ $paginaHistoricoAtual = max(1, (int) ($_GET['pagina_historico'] ?? 1));
 $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 
 // Conta o total de registros no histórico deste pet para calcular as páginas.
-$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM vw_historico_pet WHERE pet_id = :pet_id');
+$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM lancamentos_diarios WHERE pet_id = :pet_id');
 $stmtCountHist->execute([':pet_id' => $id]);
 $totalRegistrosHistorico = (int) $stmtCountHist->fetchColumn();
 $totalPaginasHistorico = max(1, ceil($totalRegistrosHistorico / $itensHistoricoPorPagina));
@@ -101,54 +132,71 @@ if ($paginaHistoricoAtual > $totalPaginasHistorico) {
     $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 }
 
-// Consulta o histórico de atendimentos do pet com limite e offset aplicados.
-$sqlHistorico = '
+// Consulta o histórico do pet paginado, agregando pagamentos e movimentos
+// somente para os lançamentos que realmente aparecem nesta página.
+$sqlHistorico = <<<'SQL'
     SELECT
-        h.*,
+        p.id AS pet_id,
+        p.nome AS pet,
+        c.id AS cliente_id,
+        c.nome AS cliente,
+        f.data_fechamento,
+        l.id AS lancamento_diario_id,
+        l.atendimento_id,
+        s.id AS servico_id,
+        s.nome AS servico,
+        l.descricao,
+        l.valor_servico,
+        COALESCE(ad.total_adicionais, 0) AS total_adicionais,
+        l.valor_servico + COALESCE(ad.total_adicionais, 0) AS valor_total,
         COALESCE(
-            NULLIF(CONCAT_WS(\' + \', pg.formas, mov.movimentos), \'\'),
-            \'Não informado\'
+            NULLIF(CONCAT_WS(' + ', pg.formas, mov.movimentos), ''),
+            'Não informado'
         ) AS forma_pagamento
-    FROM vw_historico_pet h
+    FROM lancamentos_diarios l
+    JOIN pets p ON p.id = l.pet_id
+    JOIN clientes c ON c.id = p.cliente_id
+    JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
+    JOIN servicos s ON s.id = l.servico_id
 
-    LEFT JOIN (
-        SELECT
-            p.lancamento_diario_id,
-            STRING_AGG(DISTINCT fp.nome, \' + \' ORDER BY fp.nome) AS formas
-        FROM pagamentos p
-        JOIN formas_pagamento fp
-            ON fp.id = p.forma_pagamento_id
-        WHERE p.estornado = FALSE
-          AND p.lancamento_diario_id IS NOT NULL
-        GROUP BY p.lancamento_diario_id
-    ) pg
-        ON pg.lancamento_diario_id = h.lancamento_diario_id
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
+        FROM lancamento_adicionais la
+        WHERE la.lancamento_diario_id = l.id
+    ) ad ON TRUE
 
-    LEFT JOIN (
-        SELECT
-            lancamento_diario_id,
-            STRING_AGG(
-                DISTINCT CASE
-                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'SAIDA\'
-                        THEN \'Crédito utilizado\'
-                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'ENTRADA\'
-                        THEN \'Crédito gerado\'
-                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'ENTRADA\'
-                        THEN \'Débito pendente\'
-                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'SAIDA\'
-                        THEN \'Débito pago\'
-                END,
-                \' + \'
-            ) AS movimentos
-        FROM movimentacoes_cliente
-        WHERE lancamento_diario_id IS NOT NULL
-        GROUP BY lancamento_diario_id
-    ) mov
-        ON mov.lancamento_diario_id = h.lancamento_diario_id
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(DISTINCT fp.nome, ' + ' ORDER BY fp.nome) AS formas
+        FROM pagamentos pag
+        JOIN formas_pagamento fp ON fp.id = pag.forma_pagamento_id
+        WHERE pag.estornado = FALSE
+          AND pag.lancamento_diario_id = l.id
+    ) pg ON TRUE
 
-    WHERE h.pet_id = :pet_id
-    ORDER BY h.data_fechamento DESC, h.lancamento_diario_id DESC
-    LIMIT ' . $itensHistoricoPorPagina . ' OFFSET ' . $offsetHistorico;
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(
+            DISTINCT CASE
+                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN 'Crédito utilizado'
+                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN 'Crédito gerado'
+                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN 'Débito pendente'
+                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN 'Débito pago'
+            END,
+            ' + '
+        ) AS movimentos
+        FROM movimentacoes_cliente m
+        WHERE m.lancamento_diario_id = l.id
+    ) mov ON TRUE
+
+    WHERE l.pet_id = :pet_id
+    ORDER BY f.data_fechamento DESC, l.id DESC
+    LIMIT __LIMIT__ OFFSET __OFFSET__
+SQL;
+
+$sqlHistorico = str_replace(
+    ['__LIMIT__', '__OFFSET__'],
+    [(string) $itensHistoricoPorPagina, (string) $offsetHistorico],
+    $sqlHistorico
+);
 
 $stmt = $pdo->prepare($sqlHistorico);
 $stmt->execute([':pet_id' => $id]);

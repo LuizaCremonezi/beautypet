@@ -538,12 +538,32 @@ function nomePerfilUsuario(?string $perfil): string
     };
 }
 
+function invalidarCacheUsuarios(): void
+{
+    unset(
+        $_SESSION['bp_cache_usuario_atual'],
+        $_SESSION['bp_cache_usuarios_ativos']
+    );
+}
+
 function obterUsuarioAtual(PDO $pdo): ?array
 {
     $usuarioId = $_SESSION['usuario_id'] ?? null;
 
     if (!$usuarioId) {
         return null;
+    }
+
+    // Evita uma ida ao Supabase a cada troca de página.
+    // O cache é curto e fica preso à sessão do usuário.
+    $cache = $_SESSION['bp_cache_usuario_atual'] ?? null;
+    if (
+        is_array($cache)
+        && (int) ($cache['usuario_id'] ?? 0) === (int) $usuarioId
+        && (int) ($cache['expira_em'] ?? 0) >= time()
+        && is_array($cache['dados'] ?? null)
+    ) {
+        return $cache['dados'];
     }
 
     $stmt = $pdo->prepare(
@@ -557,14 +577,31 @@ function obterUsuarioAtual(PDO $pdo): ?array
 
     if (!$usuario) {
         unset($_SESSION['usuario_id']);
+        invalidarCacheUsuarios();
         return null;
     }
+
+    $_SESSION['bp_cache_usuario_atual'] = [
+        'usuario_id' => (int) $usuarioId,
+        'expira_em'  => time() + 60,
+        'dados'      => $usuario,
+    ];
 
     return $usuario;
 }
 
 function listarUsuariosAtivos(PDO $pdo): array
 {
+    $cache = $_SESSION['bp_cache_usuarios_ativos'] ?? null;
+
+    if (
+        is_array($cache)
+        && (int) ($cache['expira_em'] ?? 0) >= time()
+        && is_array($cache['dados'] ?? null)
+    ) {
+        return $cache['dados'];
+    }
+
     $stmt = $pdo->query(
         'SELECT id, nome, email, perfil
          FROM usuarios
@@ -572,7 +609,14 @@ function listarUsuariosAtivos(PDO $pdo): array
          ORDER BY nome'
     );
 
-    return $stmt->fetchAll();
+    $usuarios = $stmt->fetchAll();
+
+    $_SESSION['bp_cache_usuarios_ativos'] = [
+        'expira_em' => time() + 60,
+        'dados'     => $usuarios,
+    ];
+
+    return $usuarios;
 }
 
 function definirMensagemUsuario(string $tipo, string $texto): void
@@ -1256,6 +1300,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['acao'] ?? '') === 'trocar_
 
     session_regenerate_id(true);
     $_SESSION['usuario_id'] = (int) $usuarioTroca['id'];
+    invalidarCacheUsuarios();
     unset($_SESSION['usuario_troca_email']);
     definirMensagemUsuario('success', 'Usuário alterado para ' . $usuarioTroca['nome'] . '.');
     // Redireciona o navegador após a operação para evitar reenvio do formulário e atualizar a tela.

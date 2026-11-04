@@ -2175,7 +2175,9 @@ $servicos = $pdo->query(
 // Transforma todas as linhas retornadas pela consulta em uma lista para uso na página.
 )->fetchAll();
 
-// Prepara uma consulta em "lancamentos_diarios" para carregar os dados necessários a esta etapa.
+// Carrega os lançamentos do fechamento atual.
+// Agregações de adicionais, pagamentos e saldos são LATERAL e filtradas por lançamento,
+// evitando recalcular essas tabelas inteiras para abrir um único dia.
 $stmt = $pdo->prepare(
     "SELECT
         l.id,
@@ -2188,9 +2190,9 @@ $stmt = $pdo->prepare(
         cs.nome AS categoria,
         pa.nome AS pacote,
         l.creditos_pacote_usados,
-        vt.valor_servico,
-        vt.total_adicionais,
-        vt.valor_total_lancamento,
+        l.valor_servico,
+        COALESCE(ad.total_adicionais, 0) AS total_adicionais,
+        l.valor_servico + COALESCE(ad.total_adicionais, 0) AS valor_total_lancamento,
         COALESCE(pg.dinheiro, 0) AS dinheiro,
         COALESCE(pg.pix, 0) AS pix,
         COALESCE(pg.cartao, 0) AS cartao,
@@ -2202,47 +2204,43 @@ $stmt = $pdo->prepare(
      JOIN clientes c ON c.id = p.cliente_id
      JOIN servicos s ON s.id = l.servico_id
      JOIN categorias_servico cs ON cs.id = s.categoria_id
-     JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
      LEFT JOIN pet_pacotes pp ON pp.id = l.pet_pacote_id
      LEFT JOIN pacotes pa ON pa.id = pp.pacote_id
-     LEFT JOIN (
+
+     LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
+        FROM lancamento_adicionais la
+        WHERE la.lancamento_diario_id = l.id
+     ) ad ON TRUE
+
+     LEFT JOIN LATERAL (
         SELECT
-            p.lancamento_diario_id,
-            SUM(CASE WHEN fp.nome = 'Dinheiro' THEN p.valor ELSE 0 END) AS dinheiro,
-            SUM(CASE WHEN fp.nome = 'Pix' THEN p.valor ELSE 0 END) AS pix,
-            SUM(CASE WHEN fp.nome IN ('Cartão', 'Cartão de débito', 'Cartão de crédito') THEN p.valor ELSE 0 END) AS cartao
-        FROM pagamentos p
-        JOIN formas_pagamento fp ON fp.id = p.forma_pagamento_id
-        WHERE p.estornado = FALSE
-        GROUP BY p.lancamento_diario_id
-     ) pg ON pg.lancamento_diario_id = l.id
-     LEFT JOIN (
+            COALESCE(SUM(pag.valor) FILTER (WHERE fp.nome = 'Dinheiro'), 0) AS dinheiro,
+            COALESCE(SUM(pag.valor) FILTER (WHERE fp.nome = 'Pix'), 0) AS pix,
+            COALESCE(SUM(pag.valor) FILTER (
+                WHERE fp.nome IN ('Cartão', 'Cartão de débito', 'Cartão de crédito')
+            ), 0) AS cartao
+        FROM pagamentos pag
+        JOIN formas_pagamento fp ON fp.id = pag.forma_pagamento_id
+        WHERE pag.estornado = FALSE
+          AND pag.lancamento_diario_id = l.id
+     ) pg ON TRUE
+
+     LEFT JOIN LATERAL (
         SELECT
-            lancamento_diario_id,
-            SUM(
-                CASE
-                    WHEN tipo_saldo = 'CREDITO' AND operacao = 'SAIDA'
-                        THEN valor
-                    ELSE 0
-                END
-            ) AS credito_utilizado,
-            SUM(
-                CASE
-                    WHEN tipo_saldo = 'DEBITO' AND operacao = 'ENTRADA'
-                        THEN valor
-                    ELSE 0
-                END
-            ) AS debito_gerado,
-            SUM(
-                CASE
-                    WHEN tipo_saldo = 'DEBITO' AND operacao = 'SAIDA'
-                        THEN valor
-                    ELSE 0
-                END
-            ) AS debito_pago
-        FROM movimentacoes_cliente
-        GROUP BY lancamento_diario_id
-     ) mov ON mov.lancamento_diario_id = l.id
+            COALESCE(SUM(m.valor) FILTER (
+                WHERE m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA'
+            ), 0) AS credito_utilizado,
+            COALESCE(SUM(m.valor) FILTER (
+                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA'
+            ), 0) AS debito_gerado,
+            COALESCE(SUM(m.valor) FILTER (
+                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA'
+            ), 0) AS debito_pago
+        FROM movimentacoes_cliente m
+        WHERE m.lancamento_diario_id = l.id
+     ) mov ON TRUE
+
      WHERE l.fechamento_diario_id = :fechamento
      ORDER BY l.id"
 );
@@ -2329,13 +2327,48 @@ foreach ($lancamentosBrutos as $item) {
 // Reúne os registros retornados pelo banco para montar a resposta ou listagem da interface.
 $registros = array_values($registros);
 
-// Prepara uma consulta em "vw_fechamento_diario" para carregar os dados necessários a esta etapa.
-$stmt = $pdo->prepare('SELECT * FROM vw_fechamento_diario WHERE fechamento_diario_id = :id');
-// Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-$stmt->execute([':id' => $fechamentoId]);
-// Obtém a próxima linha retornada pela consulta como um registro associativo.
+// Resumo financeiro somente do fechamento atual.
+// Evita consultar a view global vw_fechamento_diario, que agrega todos os dias da base.
+$stmt = $pdo->prepare(
+    "SELECT
+        COALESCE(SUM(l.valor_servico + COALESCE(ad.total_adicionais, 0)), 0) AS total_comercializado,
+        COALESCE(SUM(COALESCE(ad.total_adicionais, 0)), 0) AS total_adicionais,
+        COALESCE((
+            SELECT SUM(m.valor)
+            FROM movimentacoes_cliente m
+            WHERE m.fechamento_diario_id = :id_credito
+              AND m.tipo_saldo = 'CREDITO'
+              AND m.operacao = 'SAIDA'
+        ), 0) AS credito_utilizado,
+        COALESCE((
+            SELECT SUM(m.valor)
+            FROM movimentacoes_cliente m
+            WHERE m.fechamento_diario_id = :id_debito_gerado
+              AND m.tipo_saldo = 'DEBITO'
+              AND m.operacao = 'ENTRADA'
+        ), 0) AS debito_gerado,
+        COALESCE((
+            SELECT SUM(m.valor)
+            FROM movimentacoes_cliente m
+            WHERE m.fechamento_diario_id = :id_debito_pago
+              AND m.tipo_saldo = 'DEBITO'
+              AND m.operacao = 'SAIDA'
+        ), 0) AS debito_pago
+     FROM lancamentos_diarios l
+     LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
+        FROM lancamento_adicionais la
+        WHERE la.lancamento_diario_id = l.id
+     ) ad ON TRUE
+     WHERE l.fechamento_diario_id = :id_lancamentos"
+);
+$stmt->execute([
+    ':id_credito'       => $fechamentoId,
+    ':id_debito_gerado' => $fechamentoId,
+    ':id_debito_pago'   => $fechamentoId,
+    ':id_lancamentos'   => $fechamentoId,
+]);
 $resumo = $stmt->fetch() ?: [];
-
 // Prepara uma consulta em "lancamentos_diarios" para carregar os dados necessários a esta etapa.
 $stmt = $pdo->prepare(
     "SELECT
@@ -2395,11 +2428,17 @@ $stmt = $pdo->prepare(
         cs.nome AS categoria,
         COUNT(l.id) AS quantidade_lancamentos,
         COUNT(DISTINCT l.pet_id) AS quantidade_pets,
-        COALESCE(SUM(vt.valor_total_lancamento), 0) AS total_servico
+        COALESCE(SUM(
+            l.valor_servico
+            + COALESCE((
+                SELECT SUM(la.valor)
+                FROM lancamento_adicionais la
+                WHERE la.lancamento_diario_id = l.id
+            ), 0)
+        ), 0) AS total_servico
      FROM lancamentos_diarios l
      JOIN servicos s ON s.id = l.servico_id
      JOIN categorias_servico cs ON cs.id = s.categoria_id
-     JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
      WHERE l.fechamento_diario_id = :id
        AND LOWER(cs.nome) <> 'financeiro'
      GROUP BY s.id, s.nome, cs.nome

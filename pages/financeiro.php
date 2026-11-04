@@ -71,22 +71,71 @@ $tutoresComDebito = [];
 $totalDebitos = 0.0;
 $totalCreditos = 0.0;
 try {
-    $totais = $pdo->query(
-        'SELECT COALESCE(SUM(saldo_debito), 0) AS debitos, COALESCE(SUM(saldo_credito), 0) AS creditos
-         FROM vw_saldo_cliente'
-    )->fetch() ?: [];
-    $totalDebitos = (float) ($totais['debitos'] ?? 0);
-    $totalCreditos = (float) ($totais['creditos'] ?? 0);
-
-    $tutoresComDebito = $pdo->query(
-        'SELECT c.id, c.nome, c.telefone_principal, s.saldo_debito
-         FROM vw_saldo_cliente s
+    // Uma única consulta calcula os saldos atuais e devolve os 15 maiores débitos.
+    // Os totais gerais vêm por window function, evitando consultar vw_saldo_cliente duas vezes.
+    $stmt = $pdo->query(
+        "WITH saldos AS MATERIALIZED (
+            SELECT
+                m.cliente_id,
+                COALESCE(SUM(
+                    CASE
+                        WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                        WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                        ELSE 0
+                    END
+                ), 0.00) AS saldo_credito,
+                COALESCE(SUM(
+                    CASE
+                        WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                        WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                        ELSE 0
+                    END
+                ), 0.00) AS saldo_debito
+            FROM movimentacoes_cliente m
+            GROUP BY m.cliente_id
+         ),
+         saldos_com_totais AS (
+            SELECT
+                s.*,
+                SUM(s.saldo_debito) OVER() AS total_debitos,
+                SUM(s.saldo_credito) OVER() AS total_creditos
+            FROM saldos s
+         )
+         SELECT
+            c.id,
+            c.nome,
+            c.telefone_principal,
+            s.saldo_debito,
+            s.total_debitos,
+            s.total_creditos
+         FROM saldos_com_totais s
          JOIN clientes c ON c.id = s.cliente_id
          WHERE s.saldo_debito > 0
            AND c.ativo = TRUE
          ORDER BY s.saldo_debito DESC
-         LIMIT 15'
-    )->fetchAll();
+         LIMIT 15"
+    );
+
+    $tutoresComDebito = $stmt->fetchAll();
+
+    if ($tutoresComDebito) {
+        $totalDebitos = (float) ($tutoresComDebito[0]['total_debitos'] ?? 0);
+        $totalCreditos = (float) ($tutoresComDebito[0]['total_creditos'] ?? 0);
+    } else {
+        // Se não há débito positivo, ainda precisamos do total de créditos.
+        $stmt = $pdo->query(
+            "SELECT
+                COALESCE(SUM(
+                    CASE
+                        WHEN tipo_saldo = 'CREDITO' AND operacao = 'ENTRADA' THEN valor
+                        WHEN tipo_saldo = 'CREDITO' AND operacao = 'SAIDA' THEN -valor
+                        ELSE 0
+                    END
+                ), 0.00) AS creditos
+             FROM movimentacoes_cliente"
+        );
+        $totalCreditos = (float) $stmt->fetchColumn();
+    }
 } catch (Throwable $erro) {
     $errosConsulta[] = 'saldos';
 }

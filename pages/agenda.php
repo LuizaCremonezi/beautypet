@@ -753,15 +753,11 @@ $stmt = $pdo->prepare(
      LEFT JOIN categorias_servico cs
        ON cs.id = s.categoria_id
      WHERE a.status IN ('CONFIRMADO', 'EM_ATENDIMENTO', 'CONCLUIDO')
-       AND (
-            a.data_hora_inicio::date = :data_inicio
-            OR (
-                a.data_hora_fim IS NOT NULL
-                AND :data_intervalo BETWEEN
-                    a.data_hora_inicio::date
-                    AND a.data_hora_fim::date
-            )
-       )
+       AND a.data_hora_inicio < CAST(:fim_dia AS timestamp)
+       AND COALESCE(
+            a.data_hora_fim,
+            a.data_hora_inicio + INTERVAL '30 minutes'
+       ) >= CAST(:inicio_dia AS timestamp)
      GROUP BY
         a.id,
         a.data_hora_inicio,
@@ -785,8 +781,8 @@ $stmt = $pdo->prepare(
 
 // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
 $stmt->execute([
-    ':data_inicio'    => $dataSelecionada,
-    ':data_intervalo' => $dataSelecionada,
+    ':inicio_dia' => $dataSelecionada . ' 00:00:00',
+    ':fim_dia'    => (new DateTime($dataSelecionada))->modify('+1 day')->format('Y-m-d') . ' 00:00:00',
 ]);
 
 // Transforma todas as linhas retornadas pela consulta em uma lista para uso na página.

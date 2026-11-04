@@ -137,6 +137,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $podeCriar) {
                 // Armazena o identificador "novoId" utilizado para relacionar ou localizar o registro no banco.
                 $novoId = (int) $pdo->lastInsertId();
 
+                // A lista de usuários do cabeçalho usa cache curto para acelerar a navegação.
+                // Invalida o cache imediatamente após criar uma nova conta.
+                invalidarCacheUsuarios();
+
                 // Verifica a condição abaixo antes de executar este bloco.
                 if ($primeiroUsuario) {
                     $_SESSION['usuario_id'] = $novoId;

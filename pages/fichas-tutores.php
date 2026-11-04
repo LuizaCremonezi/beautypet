@@ -52,41 +52,87 @@ if ($paginaAtual > $totalPaginas) {
     $offset = ($paginaAtual - 1) * $itensPorPagina;
 }
 
-// Consulta principal com LIMIT e OFFSET para trazer apenas os tutores da página atual
-$sql = '
+// Consulta otimizada: primeiro seleciona somente os tutores da página atual.
+// Os totais de pets, gastos e saldos são calculados depois, apenas para esses 12 registros.
+$sql = <<<'SQL'
+    WITH clientes_base AS MATERIALIZED (
+        SELECT
+            c.id,
+            c.nome,
+            c.cpf,
+            c.email,
+            c.telefone_principal
+        FROM clientes c
+        __WHERE__
+        ORDER BY c.nome
+        LIMIT __LIMIT__ OFFSET __OFFSET__
+    )
     SELECT
-        c.id,
-        c.nome,
-        c.cpf,
-        c.email,
-        c.telefone_principal,
+        cb.id,
+        cb.nome,
+        cb.cpf,
+        cb.email,
+        cb.telefone_principal,
         COALESCE(p.total_pets, 0)        AS total_pets,
         COALESCE(g.total_gasto, 0.00)   AS total_gasto,
         COALESCE(s.saldo_credito, 0.00) AS saldo_credito,
         COALESCE(s.saldo_debito, 0.00)  AS saldo_debito
-    FROM clientes c
-    LEFT JOIN (
+    FROM clientes_base cb
+
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS total_pets
+        FROM pets p
+        WHERE p.cliente_id = cb.id
+          AND p.ativo = TRUE
+    ) p ON TRUE
+
+    LEFT JOIN LATERAL (
         SELECT
-            cliente_id,
-            COUNT(*) AS total_pets
-        FROM pets
-        WHERE ativo = TRUE
-        GROUP BY cliente_id
-    ) p
-        ON p.cliente_id = c.id
-    LEFT JOIN (
+            COALESCE(
+                SUM(
+                    l.valor_servico
+                    + COALESCE((
+                        SELECT SUM(la.valor)
+                        FROM lancamento_adicionais la
+                        WHERE la.lancamento_diario_id = l.id
+                    ), 0)
+                ),
+                0
+            ) AS total_gasto
+        FROM pets p2
+        JOIN lancamentos_diarios l
+            ON l.pet_id = p2.id
+        WHERE p2.cliente_id = cb.id
+    ) g ON TRUE
+
+    LEFT JOIN LATERAL (
         SELECT
-            cliente_id,
-            SUM(total_gasto) AS total_gasto
-        FROM vw_gastos_cliente_mes
-        GROUP BY cliente_id
-    ) g
-        ON g.cliente_id = c.id
-    LEFT JOIN vw_saldo_cliente s
-        ON s.cliente_id = c.id
-    ' . $whereSql . '
-    ORDER BY c.nome
-    LIMIT ' . $itensPorPagina . ' OFFSET ' . $offset;
+            COALESCE(SUM(
+                CASE
+                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                    ELSE 0
+                END
+            ), 0.00) AS saldo_credito,
+            COALESCE(SUM(
+                CASE
+                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
+                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
+                    ELSE 0
+                END
+            ), 0.00) AS saldo_debito
+        FROM movimentacoes_cliente m
+        WHERE m.cliente_id = cb.id
+    ) s ON TRUE
+
+    ORDER BY cb.nome
+SQL;
+
+$sql = str_replace(
+    ['__WHERE__', '__LIMIT__', '__OFFSET__'],
+    [$whereSql, (string) $itensPorPagina, (string) $offset],
+    $sql
+);
 
 // Executa a consulta paginada dos tutores
 $stmt = $pdo->prepare($sql);

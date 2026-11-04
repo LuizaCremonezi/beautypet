@@ -8,80 +8,48 @@ require __DIR__ . '/../config/config.php';
 // Caso nenhum termo seja informado, utiliza uma string vazia.
 $busca = trim($_GET['busca'] ?? '');
 
-// Consulta os dados dos pets, tutores, espécies, raças,
-// informações financeiras e pacotes ativos.
-$sql = '
-    SELECT
-        p.id,
-        p.nome,
-        p.foto_url,
-        p.peso,
-        p.porte,
-        p.sexo,
-        c.nome AS tutor,
-        e.nome AS especie,
-        r.nome AS raca,
-        COALESCE(g.total_gasto, 0.00)       AS total_gasto,
-        COALESCE(pkg.pacotes_ativos, 0)    AS pacotes_ativos,
-        COALESCE(pkg.creditos_restantes, 0) AS creditos_restantes,
-        pkg.resumo_pacotes
-    FROM pets p
-    JOIN clientes c
-        ON c.id = p.cliente_id
-    JOIN especies e
-        ON e.id = p.especie_id
-    LEFT JOIN racas r
-        ON r.id = p.raca_id
-
-    LEFT JOIN (
+// Consulta otimizada: primeiro limita os pets exibidos e só depois calcula
+// histórico financeiro e pacotes desses registros. Isso evita agregar milhares
+// de pets para mostrar apenas os primeiros resultados da tela.
+$sql = <<<'SQL'
+    WITH pets_base AS MATERIALIZED (
         SELECT
-            pet_id,
-            SUM(valor_total_lancamento) AS total_gasto
-        FROM vw_total_lancamento
-        GROUP BY pet_id
-    ) g
-        ON g.pet_id = p.id
+            p.id,
+            p.cliente_id,
+            p.nome,
+            p.foto_url,
+            p.peso,
+            p.porte,
+            p.sexo,
+            c.nome AS tutor,
+            e.nome AS especie,
+            r.nome AS raca
+        FROM pets p
+        JOIN clientes c
+            ON c.id = p.cliente_id
+        JOIN especies e
+            ON e.id = p.especie_id
+        LEFT JOIN racas r
+            ON r.id = p.raca_id
+        WHERE p.ativo = TRUE
+          AND c.ativo = TRUE
+SQL;
 
-    LEFT JOIN (
-        SELECT
-            pet_id,
-            COUNT(*) AS pacotes_ativos,
-            SUM(creditos_restantes) AS creditos_restantes,
-            STRING_AGG(
-                CONCAT(pacote, \': \', creditos_restantes, \' restante(s)\'),
-                \', \'
-                ORDER BY pacote
-            ) AS resumo_pacotes
-        FROM vw_saldo_pacotes
-        WHERE status = \'ATIVO\'
-          AND creditos_restantes > 0
-        GROUP BY pet_id
-    ) pkg
-        ON pkg.pet_id = p.id
-
-    WHERE p.ativo = TRUE
-      AND c.ativo = TRUE
-';
-
-// Cria o array que armazenará os parâmetros
-// utilizados na consulta SQL.
+// Cria o array que armazenará os parâmetros utilizados na consulta SQL.
 $parametros = [];
 
 // Verifica se existe algum termo de busca.
 if ($busca !== '') {
+    $sql .= <<<'SQL'
 
-    // Adiciona à consulta a possibilidade de pesquisar
-    // pelo nome do pet, tutor, espécie ou raça.
-    $sql .= '
         AND (
             p.nome ILIKE :pet
             OR c.nome ILIKE :tutor
             OR e.nome ILIKE :especie
             OR r.nome ILIKE :raca
         )
-    ';
+SQL;
 
-    // Define os parâmetros utilizados na pesquisa.
     $parametros = [
         ':pet'     => '%' . $busca . '%',
         ':tutor'   => '%' . $busca . '%',
@@ -90,8 +58,73 @@ if ($busca !== '') {
     ];
 }
 
-// Organiza os pets em ordem alfabética pelo nome.
-$sql .= ' ORDER BY p.nome LIMIT 60';
+// O LIMIT fica dentro da CTE. Os agregados financeiros abaixo trabalham
+// somente com os pets que realmente serão mostrados.
+$sql .= <<<'SQL'
+
+        ORDER BY p.nome
+        LIMIT 60
+    )
+    SELECT
+        pb.id,
+        pb.nome,
+        pb.foto_url,
+        pb.peso,
+        pb.porte,
+        pb.sexo,
+        pb.tutor,
+        pb.especie,
+        pb.raca,
+        COALESCE(g.total_gasto, 0.00) AS total_gasto,
+        COALESCE(pkg.pacotes_ativos, 0) AS pacotes_ativos,
+        COALESCE(pkg.creditos_restantes, 0) AS creditos_restantes,
+        pkg.resumo_pacotes
+    FROM pets_base pb
+
+    LEFT JOIN LATERAL (
+        SELECT
+            COALESCE(
+                SUM(
+                    l.valor_servico
+                    + COALESCE((
+                        SELECT SUM(la.valor)
+                        FROM lancamento_adicionais la
+                        WHERE la.lancamento_diario_id = l.id
+                    ), 0)
+                ),
+                0
+            ) AS total_gasto
+        FROM lancamentos_diarios l
+        WHERE l.pet_id = pb.id
+    ) g ON TRUE
+
+    LEFT JOIN LATERAL (
+        SELECT
+            COUNT(*) AS pacotes_ativos,
+            COALESCE(SUM(x.creditos_restantes), 0) AS creditos_restantes,
+            STRING_AGG(
+                CONCAT(x.pacote, ': ', x.creditos_restantes, ' restante(s)'),
+                ', ' ORDER BY x.pacote
+            ) AS resumo_pacotes
+        FROM (
+            SELECT
+                pp.id,
+                pa.nome AS pacote,
+                pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_restantes
+            FROM pet_pacotes pp
+            JOIN pacotes pa
+                ON pa.id = pp.pacote_id
+            LEFT JOIN lancamentos_diarios l
+                ON l.pet_pacote_id = pp.id
+            WHERE pp.pet_id = pb.id
+              AND pp.status = 'ATIVO'
+            GROUP BY pp.id, pa.nome, pp.quantidade_creditos
+            HAVING pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) > 0
+        ) x
+    ) pkg ON TRUE
+
+    ORDER BY pb.nome
+SQL;
 
 // Prepara a consulta SQL.
 $stmt = $pdo->prepare($sql);

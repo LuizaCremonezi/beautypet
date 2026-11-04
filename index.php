@@ -30,17 +30,20 @@ $paginaAtiva = 'dashboard';
 // Armazena em "hoje" a data de referencia usada pelos indicadores do topo.
 $hoje = date('Y-m-d');
 
+// Lista os pets afastados primeiro. A consulta também devolve o total geral
+// (COUNT(*) OVER()), então o Dashboard não precisa repetir a mesma agregação.
+$petsAfastados = petsSemRetorno($pdo, ANALISE_DIAS_SEM_RETORNO, 500);
+$totalPetsAfastados = $petsAfastados
+    ? (int) ($petsAfastados[0]['total_afastados'] ?? count($petsAfastados))
+    : 0;
+
 // Executa as consultas que alimentam cada bloco visual da tela.
-$resumo = resumoDoDia($pdo, $hoje);
+$resumo = resumoDoDia($pdo, $hoje, $totalPetsAfastados);
 $serieDiaria = faturamentoUltimosDias($pdo, 7);
 $serieMensal = evolucaoMensal($pdo, 6);
 $servicosTop = servicosMaisRealizados($pdo);
 $pagamentos = formasDePagamento($pdo);
 $atendimentos = atendimentosDoDia($pdo, $hoje);
-
-// Lista os pets que estao sem retornar, usada quando o card de alerta e aberto.
-// O limite alto existe apenas para proteger a tela de uma lista gigante.
-$petsAfastados = petsSemRetorno($pdo, ANALISE_DIAS_SEM_RETORNO, 500);
 
 // Soma o total recebido no periodo para poder calcular a porcentagem de cada forma de pagamento.
 $totalPagamentos = array_sum(array_map(
