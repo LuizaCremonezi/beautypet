@@ -551,11 +551,6 @@ function pagamentosPostFechamento(array $post): array
 }
 
 /**
- * Executa a responsabilidade específica de "inserirFinanceiroRegistroFechamento" e devolve/produz o resultado necessário para o restante do módulo.
- * Mantém esta regra isolada para evitar repetição e facilitar manutenção/testes.
- */
-
-/**
  * Calcula os números que devem ser conferidos antes de encerrar o dia.
  *
  * A contagem usa pets únicos por serviço. Assim, se o mesmo pet tiver dois
@@ -2040,7 +2035,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->rollBack();
             }
 
-            // HEURÍSTICA 9: registra a causa e garante ao usuário que nada foi gravado.
+            // HEURÍSTICA 9: registra a causa e garante ao usuário que nada foi alterado.
             error_log('[BeautyPet] finalizar fechamento: ' . $erro->getMessage());
             $mensagem = erroDeRegra($erro)
                 ? $erro->getMessage()
@@ -2175,9 +2170,7 @@ $servicos = $pdo->query(
 // Transforma todas as linhas retornadas pela consulta em uma lista para uso na página.
 )->fetchAll();
 
-// Carrega os lançamentos do fechamento atual.
-// Agregações de adicionais, pagamentos e saldos são LATERAL e filtradas por lançamento,
-// evitando recalcular essas tabelas inteiras para abrir um único dia.
+// Prepara uma consulta em "lancamentos_diarios" para carregar os dados necessários a esta etapa.
 $stmt = $pdo->prepare(
     "SELECT
         l.id,
@@ -2190,9 +2183,9 @@ $stmt = $pdo->prepare(
         cs.nome AS categoria,
         pa.nome AS pacote,
         l.creditos_pacote_usados,
-        l.valor_servico,
-        COALESCE(ad.total_adicionais, 0) AS total_adicionais,
-        l.valor_servico + COALESCE(ad.total_adicionais, 0) AS valor_total_lancamento,
+        vt.valor_servico,
+        vt.total_adicionais,
+        vt.valor_total_lancamento,
         COALESCE(pg.dinheiro, 0) AS dinheiro,
         COALESCE(pg.pix, 0) AS pix,
         COALESCE(pg.cartao, 0) AS cartao,
@@ -2204,43 +2197,47 @@ $stmt = $pdo->prepare(
      JOIN clientes c ON c.id = p.cliente_id
      JOIN servicos s ON s.id = l.servico_id
      JOIN categorias_servico cs ON cs.id = s.categoria_id
+     JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
      LEFT JOIN pet_pacotes pp ON pp.id = l.pet_pacote_id
      LEFT JOIN pacotes pa ON pa.id = pp.pacote_id
-
-     LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
-        FROM lancamento_adicionais la
-        WHERE la.lancamento_diario_id = l.id
-     ) ad ON TRUE
-
-     LEFT JOIN LATERAL (
+     LEFT JOIN (
         SELECT
-            COALESCE(SUM(pag.valor) FILTER (WHERE fp.nome = 'Dinheiro'), 0) AS dinheiro,
-            COALESCE(SUM(pag.valor) FILTER (WHERE fp.nome = 'Pix'), 0) AS pix,
-            COALESCE(SUM(pag.valor) FILTER (
-                WHERE fp.nome IN ('Cartão', 'Cartão de débito', 'Cartão de crédito')
-            ), 0) AS cartao
-        FROM pagamentos pag
-        JOIN formas_pagamento fp ON fp.id = pag.forma_pagamento_id
-        WHERE pag.estornado = FALSE
-          AND pag.lancamento_diario_id = l.id
-     ) pg ON TRUE
-
-     LEFT JOIN LATERAL (
+            p.lancamento_diario_id,
+            SUM(CASE WHEN fp.nome = 'Dinheiro' THEN p.valor ELSE 0 END) AS dinheiro,
+            SUM(CASE WHEN fp.nome = 'Pix' THEN p.valor ELSE 0 END) AS pix,
+            SUM(CASE WHEN fp.nome IN ('Cartão', 'Cartão de débito', 'Cartão de crédito') THEN p.valor ELSE 0 END) AS cartao
+        FROM pagamentos p
+        JOIN formas_pagamento fp ON fp.id = p.forma_pagamento_id
+        WHERE p.estornado = FALSE
+        GROUP BY p.lancamento_diario_id
+     ) pg ON pg.lancamento_diario_id = l.id
+     LEFT JOIN (
         SELECT
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA'
-            ), 0) AS credito_utilizado,
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA'
-            ), 0) AS debito_gerado,
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA'
-            ), 0) AS debito_pago
-        FROM movimentacoes_cliente m
-        WHERE m.lancamento_diario_id = l.id
-     ) mov ON TRUE
-
+            lancamento_diario_id,
+            SUM(
+                CASE
+                    WHEN tipo_saldo = 'CREDITO' AND operacao = 'SAIDA'
+                        THEN valor
+                    ELSE 0
+                END
+            ) AS credito_utilizado,
+            SUM(
+                CASE
+                    WHEN tipo_saldo = 'DEBITO' AND operacao = 'ENTRADA'
+                        THEN valor
+                    ELSE 0
+                END
+            ) AS debito_gerado,
+            SUM(
+                CASE
+                    WHEN tipo_saldo = 'DEBITO' AND operacao = 'SAIDA'
+                        THEN valor
+                    ELSE 0
+                END
+            ) AS debito_pago
+        FROM movimentacoes_cliente
+        GROUP BY lancamento_diario_id
+     ) mov ON mov.lancamento_diario_id = l.id
      WHERE l.fechamento_diario_id = :fechamento
      ORDER BY l.id"
 );
@@ -2327,48 +2324,13 @@ foreach ($lancamentosBrutos as $item) {
 // Reúne os registros retornados pelo banco para montar a resposta ou listagem da interface.
 $registros = array_values($registros);
 
-// Resumo financeiro somente do fechamento atual.
-// Evita consultar a view global vw_fechamento_diario, que agrega todos os dias da base.
-$stmt = $pdo->prepare(
-    "SELECT
-        COALESCE(SUM(l.valor_servico + COALESCE(ad.total_adicionais, 0)), 0) AS total_comercializado,
-        COALESCE(SUM(COALESCE(ad.total_adicionais, 0)), 0) AS total_adicionais,
-        COALESCE((
-            SELECT SUM(m.valor)
-            FROM movimentacoes_cliente m
-            WHERE m.fechamento_diario_id = :id_credito
-              AND m.tipo_saldo = 'CREDITO'
-              AND m.operacao = 'SAIDA'
-        ), 0) AS credito_utilizado,
-        COALESCE((
-            SELECT SUM(m.valor)
-            FROM movimentacoes_cliente m
-            WHERE m.fechamento_diario_id = :id_debito_gerado
-              AND m.tipo_saldo = 'DEBITO'
-              AND m.operacao = 'ENTRADA'
-        ), 0) AS debito_gerado,
-        COALESCE((
-            SELECT SUM(m.valor)
-            FROM movimentacoes_cliente m
-            WHERE m.fechamento_diario_id = :id_debito_pago
-              AND m.tipo_saldo = 'DEBITO'
-              AND m.operacao = 'SAIDA'
-        ), 0) AS debito_pago
-     FROM lancamentos_diarios l
-     LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
-        FROM lancamento_adicionais la
-        WHERE la.lancamento_diario_id = l.id
-     ) ad ON TRUE
-     WHERE l.fechamento_diario_id = :id_lancamentos"
-);
-$stmt->execute([
-    ':id_credito'       => $fechamentoId,
-    ':id_debito_gerado' => $fechamentoId,
-    ':id_debito_pago'   => $fechamentoId,
-    ':id_lancamentos'   => $fechamentoId,
-]);
+// Prepara uma consulta em "vw_fechamento_diario" para carregar os dados necessários a esta etapa.
+$stmt = $pdo->prepare('SELECT * FROM vw_fechamento_diario WHERE fechamento_diario_id = :id');
+// Executa a instrução preparada enviando os parâmetros de forma separada e segura.
+$stmt->execute([':id' => $fechamentoId]);
+// Obtém a próxima linha retornada pela consulta como um registro associativo.
 $resumo = $stmt->fetch() ?: [];
+
 // Prepara uma consulta em "lancamentos_diarios" para carregar os dados necessários a esta etapa.
 $stmt = $pdo->prepare(
     "SELECT
@@ -2428,17 +2390,11 @@ $stmt = $pdo->prepare(
         cs.nome AS categoria,
         COUNT(l.id) AS quantidade_lancamentos,
         COUNT(DISTINCT l.pet_id) AS quantidade_pets,
-        COALESCE(SUM(
-            l.valor_servico
-            + COALESCE((
-                SELECT SUM(la.valor)
-                FROM lancamento_adicionais la
-                WHERE la.lancamento_diario_id = l.id
-            ), 0)
-        ), 0) AS total_servico
+        COALESCE(SUM(vt.valor_total_lancamento), 0) AS total_servico
      FROM lancamentos_diarios l
      JOIN servicos s ON s.id = l.servico_id
      JOIN categorias_servico cs ON cs.id = s.categoria_id
+     JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
      WHERE l.fechamento_diario_id = :id
        AND LOWER(cs.nome) <> 'financeiro'
      GROUP BY s.id, s.nome, cs.nome
@@ -2478,6 +2434,25 @@ require __DIR__ . '/../includes/topo.php';
                 <?= escapar((string) $fechamento['status']) ?>
             </span>
 
+            <?php if (!$fechamentoFechado): ?>
+                <button class="daily-finish-button" type="button" data-open-daily-modal="finish">
+                    Fechar dia
+                </button>
+            <?php else: ?>
+                <div class="daily-closed-label">
+                    <i class="fa-solid fa-lock"></i>
+                    Fechado em <?= escapar(formatarDataHoraAgenda($fechamento['fechado_em'])) ?>
+                </div>
+
+                <?php if ($administrador): ?>
+                    <form method="post" action="fechamento-diario.php?data=<?= escapar($dataSelecionada) ?>">
+                        <input type="hidden" name="acao" value="reabrir_fechamento">
+                        <button class="daily-ghost-button daily-reopen-button" type="submit">
+                            Reabrir dia
+                        </button>
+                    </form>
+                <?php endif; ?>
+            <?php endif; ?>
         </div>
     </div>
     <?php if ($mensagem !== ''): ?>
@@ -2486,28 +2461,63 @@ require __DIR__ . '/../includes/topo.php';
         </div>
     <?php endif; ?>
 
-<div class="daily-date-toolbar">
-        <!-- 1. Botão Hoje -->
-        <a class="daily-today-button" href="fechamento-diario.php?data=<?= escapar(date('Y-m-d')) ?>">Hoje</a>
+<?php
+// ===== Dados da barra de datas (texto por extenso e tag do dia) =====
+$fechDiasExtenso = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+$fechMesesExtenso = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
 
-        <!-- 2. Seta Esquerda -->
-        <a class="daily-date-arrow" href="fechamento-diario.php?data=<?= escapar($dataAnterior) ?>" aria-label="Dia anterior">
-            <i class="fa-solid fa-chevron-left"></i>
-        </a>
+$fechHojeSql = date('Y-m-d');
+$fechDataObj = new DateTime($dataSelecionada);
+$fechDiaNumero = (int) $fechDataObj->format('j');
 
-        <!-- 3. Calendário (Submete automaticamente ao escolher a data) -->
-        <form method="get" action="fechamento-diario.php" class="daily-date-form">
-            <label for="dataFechamento">Data do fechamento</label>
-            <input id="dataFechamento" name="data" type="date" value="<?= escapar($dataSelecionada) ?>" onchange="this.form.submit()">
-        </form>
+$fechDataExtenso = $fechDiasExtenso[(int) $fechDataObj->format('w')] . ', '
+    . ($fechDiaNumero === 1 ? '1º' : $fechDiaNumero) . ' de '
+    . $fechMesesExtenso[(int) $fechDataObj->format('n') - 1];
 
-        <!-- 4. Seta Direita -->
-        <a class="daily-date-arrow" href="fechamento-diario.php?data=<?= escapar($dataSeguinte) ?>" aria-label="Dia seguinte">
-            <i class="fa-solid fa-chevron-right"></i>
-        </a>
+// Só mostra o ano quando a data não é do ano atual
+if ($fechDataObj->format('Y') !== date('Y')) {
+    $fechDataExtenso .= ' de ' . $fechDataObj->format('Y');
+}
 
-        <strong class="daily-date-title"><?= escapar(formatarData($dataSelecionada)) ?></strong>
+$fechDiferencaDias = (int) (new DateTime($fechHojeSql))->diff($fechDataObj)->format('%r%a');
+$fechTagDia = [-1 => 'Ontem', 0 => 'Hoje', 1 => 'Amanhã'][$fechDiferencaDias] ?? '';
+$fechEhHoje = $dataSelecionada === $fechHojeSql;
+?>
+
+<div class="daily-datebar" id="dailyDatebar" data-hoje="<?= escapar($fechHojeSql) ?>">
+    <!-- Lado esquerdo: data ativa por extenso + tag do dia -->
+    <div class="daily-datebar-info">
+        <h2 class="daily-datebar-title" id="dailyDataExtenso"><?= escapar($fechDataExtenso) ?></h2>
+        <span class="daily-datebar-tag<?= $fechTagDia === 'Hoje' ? ' is-hoje' : '' ?>"
+              id="dailyDataTag"
+              <?= $fechTagDia === '' ? 'hidden' : '' ?>><?= escapar($fechTagDia) ?></span>
     </div>
+
+    <!-- Lado direito: controles agrupados -->
+    <div class="daily-datebar-controls">
+        <!-- "Hoje" só aparece quando a data selecionada não é hoje -->
+        <a class="daily-datebar-today" id="dailyBotaoHoje"
+           href="fechamento-diario.php?data=<?= escapar($fechHojeSql) ?>"
+           <?= $fechEhHoje ? 'hidden' : '' ?>>Hoje</a>
+
+        <div class="daily-datebar-group">
+            <a class="daily-datebar-arrow" href="fechamento-diario.php?data=<?= escapar($dataAnterior) ?>" aria-label="Dia anterior">
+                <i class="fa-solid fa-chevron-left"></i>
+            </a>
+
+            <!-- Seletor de data (o JS envia o formulário ao mudar a data) -->
+            <form class="daily-datebar-form" id="dailyDataForm" method="get" action="fechamento-diario.php">
+                <label class="daily-datebar-label" for="dataFechamento">Data do fechamento</label>
+                <input id="dataFechamento" name="data" type="date" value="<?= escapar($dataSelecionada) ?>">
+                <span class="daily-datebar-caret" aria-hidden="true">▾</span>
+            </form>
+
+            <a class="daily-datebar-arrow" href="fechamento-diario.php?data=<?= escapar($dataSeguinte) ?>" aria-label="Dia seguinte">
+                <i class="fa-solid fa-chevron-right"></i>
+            </a>
+        </div>
+    </div>
+</div>
 
     <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
     <section class="daily-sheet-card">
@@ -2804,13 +2814,13 @@ require __DIR__ . '/../includes/topo.php';
             <span class="daily-detail-icon cash"><i class="fa-solid fa-cash-register"></i></span>
             <div>
                 <h2>Conferência do caixa</h2>
-                <small>O dinheiro esperado considera a abertura do caixa + os recebimentos em dinheiro.</small>
+                <small>O valor previsto considera a abertura do caixa + os recebimentos em dinheiro.</small>
             </div>
         </div>
 
         <div class="daily-cash-numbers">
             <div>
-                <span>Esperado</span>
+                <span>Previsto</span>
                 <strong><?= formatarMoeda($dinheiroEsperado) ?></strong>
             </div>
             <div>
@@ -2821,28 +2831,6 @@ require __DIR__ . '/../includes/topo.php';
                 <span>Diferença</span>
                 <strong><?= $diferencaDinheiro !== null ? formatarMoeda($diferencaDinheiro) : '—' ?></strong>
             </div>
-        </div>
-
-<div class="daily-cash-actions-area">
-            <?php if (!$fechamentoFechado): ?>
-                <button class="daily-finish-button" type="button" data-open-daily-modal="finish">
-                    Finalizar dia
-                </button>
-            <?php else: ?>
-                <div class="daily-closed-label">
-                    <i class="fa-solid fa-lock"></i>
-                    Fechado em <?= escapar(formatarDataHoraAgenda($fechamento['fechado_em'])) ?>
-                </div>
-
-                <?php if ($administrador): ?>
-                    <form method="post" action="fechamento-diario.php?data=<?= escapar($dataSelecionada) ?>">
-                        <input type="hidden" name="acao" value="reabrir_fechamento">
-                        <button class="daily-ghost-button daily-reopen-button" type="submit">
-                            Reabrir dia
-                        </button>
-                    </form>
-                <?php endif; ?>
-            <?php endif; ?>
         </div>
     </section>
 </div>
@@ -2880,33 +2868,35 @@ require __DIR__ . '/../includes/topo.php';
 
                     <div class="daily-form-grid">
                         <div class="field span-12">
-                            <!-- Rótulo do campo "Pesquisar pet ou tutor", indicando ao usuário qual informação deve ser preenchida. -->
-                            <label for="dailyPetSearch">Pesquisar pet ou tutor</label>
-                            <div
-                                class="search-picker"
-                                id="dailyPetPicker"
-                                data-search-picker="pet"
-                                data-required="1">
-                                <!-- Bloco visual "search-picker-input-wrap" que organiza esta parte da interface. -->
-                                <div class="search-picker-input-wrap">
-                                    <i class="fa-solid fa-magnifying-glass"></i>
-                                    <input
-                                        id="dailyPetSearch"
-                                        data-search-input
-                                        type="search"
-                                        autocomplete="off"
-                                        placeholder="Digite o nome do pet ou tutor"
-                                        required>
-                                    <input
-                                        id="dailyPet"
-                                        data-search-value
-                                        type="hidden"
-                                        name="pet_id">
-                                </div>
-                                <!-- Bloco visual "search-picker-results" que organiza esta parte da interface. -->
-                                <div class="search-picker-results" data-search-results hidden></div>
-                            </div>
-                        </div>
+    <!-- Rótulo do campo "Pesquisar pet ou tutor", indicando ao usuário qual informação deve ser preenchida. -->
+    <label for="dailyPetSearch">Pesquisar pet ou tutor</label>
+
+    <!-- Combobox de pet: o JS do fechamento controla este bloco pelos IDs abaixo -->
+    <div class="pet-combo" id="dailyPetPicker">
+        <div class="pet-combo-field">
+            <input
+                id="dailyPetSearch"
+                type="text"
+                autocomplete="off"
+                placeholder="Selecione ou pesquise um pet..."
+                role="combobox"
+                aria-expanded="false"
+                aria-controls="dailyPetResults"
+                aria-autocomplete="list"
+                aria-required="true">
+
+            <button type="button" class="pet-combo-clear" id="dailyPetClear" aria-label="Limpar pet" hidden>×</button>
+            <span class="pet-combo-arrow" aria-hidden="true">▾</span>
+
+            <div class="pet-combo-results" id="dailyPetResults" role="listbox" hidden></div>
+        </div>
+
+        <!-- Campo oculto enviado ao backend (mesmo id e name de antes) -->
+        <input id="dailyPet" type="hidden" name="pet_id">
+
+        <p class="pet-combo-error" id="dailyPetError" role="alert" hidden>Selecione um pet da lista.</p>
+    </div>
+</div>
                     </div>
                 </div>
 
@@ -3073,28 +3063,28 @@ require __DIR__ . '/../includes/topo.php';
                     </div>
 
                     <div class="field span-6">
-                        <label>Banho <small>Esperado: <?= (int) ($conferenciaFechamento['banho'] ?? 0) ?></small></label>
-                        <input name="quantidade_banho" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_banho'] ?? '0')) /* [BP-ALTERAÇÃO #7] Começa em 0 em vez de vazio. */ ?>">
+                        <label>Banho <small>Previsto: <?= (int) ($conferenciaFechamento['banho'] ?? 0) ?></small></label>
+                        <input name="quantidade_banho" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_banho'] ?? (int) ($conferenciaFechamento['banho'] ?? 0))) ?>">
                     </div>
 
                     <div class="field span-6">
-                        <label>Banho e tosa <small>Esperado: <?= (int) ($conferenciaFechamento['banho_tosa'] ?? 0) ?></small></label>
-                        <input name="quantidade_banho_tosa" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_banho_tosa'] ?? '0')) /* [BP-ALTERAÇÃO #7] Começa em 0 em vez de vazio. */ ?>">
+                        <label>Banho e tosa <small>Previsto: <?= (int) ($conferenciaFechamento['banho_tosa'] ?? 0) ?></small></label>
+                        <input name="quantidade_banho_tosa" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_banho_tosa'] ?? (int) ($conferenciaFechamento['banho_tosa'] ?? 0))) ?>">
                     </div>
 
                     <div class="field span-6">
-                        <label>Tosa higiênica <small>Esperado: <?= (int) ($conferenciaFechamento['higienica'] ?? 0) ?></small></label>
-                        <input name="quantidade_higienica" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_higienica'] ?? '0')) /* [BP-ALTERAÇÃO #7] Começa em 0 em vez de vazio. */ ?>">
+                        <label>Tosa higiênica <small>Previsto: <?= (int) ($conferenciaFechamento['higienica'] ?? 0) ?></small></label>
+                        <input name="quantidade_higienica" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_higienica'] ?? (int) ($conferenciaFechamento['higienica'] ?? 0))) ?>">
                     </div>
 
                     <div class="field span-6">
-                        <label>Creche <small>Esperado: <?= (int) ($conferenciaFechamento['creche'] ?? 0) ?></small></label>
-                        <input name="quantidade_creche" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_creche'] ?? '0')) /* [BP-ALTERAÇÃO #7] Começa em 0 em vez de vazio. */ ?>">
+                        <label>Creche <small>Previsto: <?= (int) ($conferenciaFechamento['creche'] ?? 0) ?></small></label>
+                        <input name="quantidade_creche" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_creche'] ?? (int) ($conferenciaFechamento['creche'] ?? 0))) ?>">
                     </div>
 
                     <div class="field span-6">
-                        <label>Hotel <small>Esperado: <?= (int) ($conferenciaFechamento['hotel'] ?? 0) ?></small></label>
-                        <input name="quantidade_hotel" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_hotel'] ?? '0')) /* [BP-ALTERAÇÃO #7] Começa em 0 em vez de vazio. */ ?>">
+                        <label>Hotel <small>Previsto: <?= (int) ($conferenciaFechamento['hotel'] ?? 0) ?></small></label>
+                        <input name="quantidade_hotel" type="number" min="0" step="1" required value="<?= escapar((string) ($_POST['quantidade_hotel'] ?? (int) ($conferenciaFechamento['hotel'] ?? 0))) ?>">
                     </div>
 
                     <div class="field span-12">
@@ -3102,18 +3092,18 @@ require __DIR__ . '/../includes/topo.php';
                     </div>
 
                     <div class="field span-4">
-                        <label>Dinheiro contado <small>Esperado: <?= formatarMoeda($conferenciaFechamento['dinheiro'] ?? 0) ?></small></label>
-                        <div class="money-input"><span>R$</span><input name="valor_dinheiro_contado" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_dinheiro_contado'] ?? '0.00')) /* [BP-ALTERAÇÃO #7] Começa em 0,00 em vez de vazio. */ ?>"></div>
+                        <label>Dinheiro contado <small>Previsto: <?= formatarMoeda($conferenciaFechamento['dinheiro'] ?? 0) ?></small></label>
+                        <div class="money-input"><span>R$</span><input name="valor_dinheiro_contado" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_dinheiro_contado'] ?? number_format((float) ($conferenciaFechamento['dinheiro'] ?? 0), 2, '.', ''))) ?>"></div>
                     </div>
 
                     <div class="field span-4">
-                        <label>Pix conferido <small>Esperado: <?= formatarMoeda($conferenciaFechamento['pix'] ?? 0) ?></small></label>
-                        <div class="money-input"><span>R$</span><input name="valor_pix_conferido" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_pix_conferido'] ?? '0.00')) /* [BP-ALTERAÇÃO #7] Começa em 0,00 em vez de vazio. */ ?>"></div>
+                        <label>Pix conferido <small>Previsto: <?= formatarMoeda($conferenciaFechamento['pix'] ?? 0) ?></small></label>
+                        <div class="money-input"><span>R$</span><input name="valor_pix_conferido" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_pix_conferido'] ?? number_format((float) ($conferenciaFechamento['pix'] ?? 0), 2, '.', ''))) ?>"></div>
                     </div>
 
                     <div class="field span-4">
-                        <label>Cartão conferido <small>Esperado: <?= formatarMoeda($conferenciaFechamento['cartao'] ?? 0) ?></small></label>
-                        <div class="money-input"><span>R$</span><input name="valor_cartao_conferido" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_cartao_conferido'] ?? '0.00')) /* [BP-ALTERAÇÃO #7] Começa em 0,00 em vez de vazio. */ ?>"></div>
+                        <label>Cartão conferido <small>Previsto: <?= formatarMoeda($conferenciaFechamento['cartao'] ?? 0) ?></small></label>
+                        <div class="money-input"><span>R$</span><input name="valor_cartao_conferido" type="number" min="0" step="0.01" required value="<?= escapar((string) ($_POST['valor_cartao_conferido'] ?? number_format((float) ($conferenciaFechamento['cartao'] ?? 0), 2, '.', ''))) ?>"></div>
                     </div>
 
                     <div class="field span-12">
@@ -3257,6 +3247,89 @@ require __DIR__ . '/../includes/topo.php';
 <!-- Script responsável pelas interações desta parte da página no navegador. -->
 <script>
 (() => {
+
+    // ===== Barra de datas =====
+const dateInput = document.querySelector('#dataFechamento');
+const dateForm = document.querySelector('#dailyDataForm');
+const datebar = document.querySelector('#dailyDatebar');
+const dateExtenso = document.querySelector('#dailyDataExtenso');
+const dateTag = document.querySelector('#dailyDataTag');
+const todayButton = document.querySelector('#dailyBotaoHoje');
+
+const DIAS_SEMANA = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+const DIAS_CURTOS = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SÁB'];
+const MESES = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+const hojeISO = datebar?.dataset.hoje || '';
+
+// Lê "AAAA-MM-DD" sem usar fuso horário (evita o bug de voltar um dia)
+const lerData = (valor) => {
+    const partes = /^(\d{4})-(\d{2})-(\d{2})$/.exec(valor || '');
+    if (!partes) return null;
+    const ano = Number(partes[1]);
+    const mes = Number(partes[2]);
+    const dia = Number(partes[3]);
+    return { ano, mes, dia, diaSemana: new Date(ano, mes - 1, dia).getDay() };
+};
+
+const dataPorExtenso = (valor) => {
+    const d = lerData(valor);
+    if (!d) return '';
+    const hoje = lerData(hojeISO);
+    let texto = `${DIAS_SEMANA[d.diaSemana]}, ${d.dia === 1 ? '1º' : d.dia} de ${MESES[d.mes - 1]}`;
+    if (hoje && d.ano !== hoje.ano) texto += ` de ${d.ano}`;
+    return texto;
+};
+
+// Formato curto usado no subtítulo do modal: "QUA, 18/11"
+const dataCurta = (valor) => {
+    const d = lerData(valor);
+    if (!d) return '';
+    return `${DIAS_CURTOS[d.diaSemana]}, ${String(d.dia).padStart(2, '0')}/${String(d.mes).padStart(2, '0')}`;
+};
+
+const tagDoDia = (valor) => {
+    const d = lerData(valor);
+    const hoje = lerData(hojeISO);
+    if (!d || !hoje) return '';
+    const diferenca = Math.round(
+        (Date.UTC(d.ano, d.mes - 1, d.dia) - Date.UTC(hoje.ano, hoje.mes - 1, hoje.dia)) / 86400000
+    );
+    return { '-1': 'Ontem', '0': 'Hoje', '1': 'Amanhã' }[String(diferenca)] || '';
+};
+
+const atualizarBarraDatas = () => {
+    const valor = dateInput.value;
+    if (!lerData(valor)) return;
+
+    dateExtenso.textContent = dataPorExtenso(valor);
+
+    const tag = tagDoDia(valor);
+    dateTag.textContent = tag;
+    dateTag.hidden = !tag;
+    dateTag.classList.toggle('is-hoje', tag === 'Hoje');
+
+    // "Hoje" só aparece quando a data selecionada é diferente da data atual
+    todayButton.hidden = valor === hojeISO;
+};
+
+if (dateInput && dateForm) {
+    // Clicar em qualquer área do seletor abre o calendário na hora
+    dateForm.addEventListener('click', () => {
+        try {
+            dateInput.showPicker();
+        } catch (erro) {
+            // Navegador sem showPicker: o input nativo cuida sozinho
+        }
+    });
+
+    // Ao mudar a data: atualiza o texto na hora e carrega o fechamento do dia
+    dateInput.addEventListener('change', () => {
+        if (!lerData(dateInput.value)) return; // ignora data incompleta
+        atualizarBarraDatas();
+        dateForm.submit();
+    });
+}
+
     // Armazena em "modalMap" um valor usado pela lógica executada no navegador.
     const modalMap = {
         launch: document.querySelector('#dailyLaunchModal'),
@@ -3275,7 +3348,7 @@ require __DIR__ . '/../includes/topo.php';
         modal.setAttribute('aria-hidden', 'false');
         document.body.classList.add('daily-modal-open');
         // Armazena em "first" um valor usado pela lógica executada no navegador.
-        const first = modal.querySelector('input:not([type="hidden"]), select, textarea');
+        const first = modal.querySelector('input:not([type="hidden"]):not([role="combobox"]), select, textarea');
         // Verifica esta condição antes de alterar a interface ou continuar o processamento.
         if (first) setTimeout(() => first.focus(), 30);
     };
@@ -3808,24 +3881,214 @@ require __DIR__ . '/../includes/topo.php';
         });
     };
 
-    // Registra um evento para executar a lógica quando o usuário interagir com este elemento.
-    petPicker?.addEventListener('search-picker:selected', refreshAllPackages);
-    // Registra um evento para executar a lógica quando o usuário interagir com este elemento.
-    petSearch?.addEventListener('input', () => setTimeout(refreshAllPackages, 0));
+    // ===== Combobox de pet =====
+const petResults = document.querySelector('#dailyPetResults');
+const petClear = document.querySelector('#dailyPetClear');
+const petError = document.querySelector('#dailyPetError');
+const URL_CADASTRO_PET = 'cadastro-pet.php'; // ajuste para a sua página de cadastro de pet
 
-    // Armazena em "setPet" um valor usado pela lógica executada no navegador.
-    const setPet = (id = '', label = '') => {
-        petValue.value = id ? String(id) : '';
-        petSearch.value = label || '';
-        petSearch.dataset.selectedLabel = label || '';
-        petSearch.setCustomValidity('');
-    };
+let petRequest = 0;
+let petDebounce = null;
+let petActive = -1;
+
+const petEsc = (texto) => String(texto ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+// Aceita campos separados (nome/raca/tutor) ou, se o PHP só mandar label, quebra por " — "
+const petNormalize = (pet) => {
+    const partes = String(pet.label || '').split(' — ').map((p) => p.trim()).filter(Boolean);
+    const nome = pet.nome || partes[0] || '';
+    const tutor = pet.tutor || (partes.length > 1 ? partes[partes.length - 1] : '');
+    const raca = pet.raca || (partes.length > 2 ? partes[1] : '');
+    return { id: pet.id, nome, raca, tutor, label: pet.label || nome };
+};
+
+const petOpenList = () => {
+    petResults.hidden = false;
+    petSearch.setAttribute('aria-expanded', 'true');
+};
+
+const petCloseList = () => {
+    petResults.hidden = true;
+    petSearch.setAttribute('aria-expanded', 'false');
+    petActive = -1;
+};
+
+const petUpdateClear = () => {
+    petClear.hidden = !petSearch.value;
+};
+
+const petRender = (pets) => {
+    petActive = -1;
+
+    if (!pets.length) {
+        petResults.innerHTML = `
+            <div class="pet-combo-empty">
+                <span>Nenhum pet encontrado</span>
+                <a href="${petEsc(URL_CADASTRO_PET)}">+ Cadastrar novo pet</a>
+            </div>`;
+    } else {
+        petResults.innerHTML = pets.map(petNormalize).map((pet) => {
+            const detalhe = [pet.raca, pet.tutor ? `Tutor: ${pet.tutor}` : '']
+                .filter(Boolean).join(' • ');
+            return `
+                <div class="pet-combo-option" role="option"
+                     data-pet-id="${petEsc(pet.id)}" data-pet-label="${petEsc(pet.label)}">
+                    <strong>${petEsc(pet.nome)}</strong>
+                    ${detalhe ? `<small>${petEsc(detalhe)}</small>` : ''}
+                </div>`;
+        }).join('');
+    }
+    petOpenList();
+};
+
+const petSearchRequest = async (termo) => {
+    const id = ++petRequest; // ignora respostas antigas
+    petResults.innerHTML = '<div class="pet-combo-empty">Buscando...</div>';
+    petOpenList();
+
+    try {
+        const resposta = await fetch(`busca-registros.php?tipo=pet&q=${encodeURIComponent(termo)}`);
+        if (!resposta.ok) throw new Error(resposta.status);
+        const pets = await resposta.json();
+        if (id !== petRequest) return;
+        petRender(Array.isArray(pets) ? pets : []);
+    } catch (erro) {
+        console.error('Erro ao buscar pets:', erro);
+        if (id !== petRequest) return;
+        petResults.innerHTML = '<div class="pet-combo-empty is-error" role="alert">Não foi possível buscar pets agora. Tente novamente.</div>';
+    }
+};
+
+// Marca o pet escolhido e trava o campo
+const petSelect = (id, label) => {
+    petValue.value = id ? String(id) : '';
+    petSearch.value = label || '';
+    petSearch.readOnly = true;
+    petPicker.classList.add('is-selected');
+    petPicker.classList.remove('is-invalid');
+    petSearch.removeAttribute('aria-invalid');
+    petError.hidden = true;
+    petUpdateClear();
+    petCloseList();
+};
+
+// Limpa o campo e destrava para uma nova busca
+const petClean = () => {
+    petValue.value = '';
+    petSearch.value = '';
+    petSearch.readOnly = false;
+    petPicker.classList.remove('is-selected');
+    petUpdateClear();
+};
+
+// Mesmo nome de antes: o resetRecordForm e o editar registro continuam chamando setPet(...)
+const setPet = (id = '', label = '') => {
+    clearTimeout(petDebounce);
+    petRequest += 1;
+    petCloseList();
+    petPicker.classList.remove('is-invalid');
+    petSearch.removeAttribute('aria-invalid');
+    petError.hidden = true;
+
+    if (id) {
+        petSelect(id, label);
+    } else {
+        petClean();
+    }
+};
+
+// focus: abre a lista na hora, mesmo sem digitar
+petSearch.addEventListener('focus', () => {
+    if (petSearch.readOnly) return;
+    petSearchRequest(petSearch.value.trim());
+});
+
+// clicar com o campo já focado e a lista fechada reabre
+petSearch.addEventListener('click', () => {
+    if (!petSearch.readOnly && petResults.hidden) petSearchRequest(petSearch.value.trim());
+});
+
+// input: filtra (o PHP busca por nome, raça ou tutor)
+petSearch.addEventListener('input', () => {
+    petUpdateClear();
+    clearTimeout(petDebounce);
+    petDebounce = setTimeout(() => petSearchRequest(petSearch.value.trim()), 250);
+});
+
+// mousedown no item: seleciona e avisa o restante da página (pacotes e débito)
+petResults.addEventListener('mousedown', (e) => {
+    e.preventDefault(); // mantém o foco no input
+    const item = e.target.closest('.pet-combo-option');
+    if (!item) return;
+    petSelect(item.dataset.petId, item.dataset.petLabel);
+    petPicker.dispatchEvent(new CustomEvent('search-picker:selected', {
+        detail: { id: item.dataset.petId, label: item.dataset.petLabel }
+    }));
+    refreshAllPackages();
+});
+
+// blur: saiu sem selecionar → limpa texto solto e pet_id
+petSearch.addEventListener('blur', () => {
+    clearTimeout(petDebounce);
+    petRequest += 1;
+    if (!petValue.value) petClean();
+    petCloseList();
+});
+
+// botão ×: limpa tudo, atualiza pacotes/débito e devolve o foco
+petClear.addEventListener('mousedown', (e) => e.preventDefault());
+petClear.addEventListener('click', () => {
+    petClean();
+    refreshAllPackages();
+    petSearch.focus(); // o focus reabre a lista
+});
+
+// Teclado: setas, Enter e Esc
+petSearch.addEventListener('keydown', (e) => {
+    const itens = Array.from(petResults.querySelectorAll('.pet-combo-option'));
+
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        if (!itens.length) return;
+        e.preventDefault();
+        petActive = e.key === 'ArrowDown'
+            ? (petActive + 1) % itens.length
+            : (petActive - 1 + itens.length) % itens.length;
+        itens.forEach((item, i) => item.classList.toggle('is-active', i === petActive));
+        itens[petActive].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter') {
+        e.preventDefault(); // Enter no campo não envia o formulário
+        if (petActive >= 0 && itens[petActive]) {
+            const item = itens[petActive];
+            petSelect(item.dataset.petId, item.dataset.petLabel);
+            petPicker.dispatchEvent(new CustomEvent('search-picker:selected', {
+                detail: { id: item.dataset.petId, label: item.dataset.petLabel }
+            }));
+            refreshAllPackages();
+        }
+    } else if (e.key === 'Escape' && !petResults.hidden) {
+        e.stopPropagation(); // fecha só a lista, não o modal
+        petCloseList();
+    }
+});
+
+// submit: bloqueia o envio se não houver pet_id
+launchForm.addEventListener('submit', (e) => {
+    if (petValue.value) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    petPicker.classList.add('is-invalid');
+    petSearch.setAttribute('aria-invalid', 'true');
+    petError.hidden = false;
+    petSearch.focus();
+}, true);
 
     // Armazena em "resetRecordForm" um valor usado pela lógica executada no navegador.
     const resetRecordForm = async () => {
         launchForm.reset();
         recordKey.value = '';
-        launchKicker.textContent = 'Novo registro';
+        launchKicker.textContent = `Novo registro • ${dataCurta(dateInput?.value)}`;
         launchTitle.textContent = 'Adicionar linha ao fechamento';
         saveRecordText.textContent = 'Salvar';
         setPet('', '');
@@ -3870,7 +4133,7 @@ require __DIR__ . '/../includes/topo.php';
                 const data = await response.json();
                 launchForm.reset();
                 recordKey.value = key;
-                launchKicker.textContent = 'Editar linha completa';
+                launchKicker.textContent = `Editar linha completa • ${dataCurta(dateInput?.value)}`;
                 launchTitle.textContent = `Editar ${data.pet_label || 'registro'}`;
                 saveRecordText.textContent = 'Salvar';
                 setPet(data.pet_id, data.pet_label);
@@ -4000,80 +4263,7 @@ require __DIR__ . '/../includes/topo.php';
     });
 })();
 
-// Adicionar dentro da IIFE existente na tag <script> do fechamento-diario.php
 
-const setupPetSearchPicker = () => {
-    const picker = document.querySelector('#dailyPetPicker');
-    if (!picker) return;
-
-    const input = picker.querySelector('[data-search-input]');
-    const hiddenValue = picker.querySelector('[data-search-value]');
-    const resultsBox = picker.querySelector('[data-search-results]');
-    let debounceTimer = null;
-
-    input.addEventListener('input', () => {
-        const query = input.value.trim();
-        clearTimeout(debounceTimer);
-
-        if (query.length < 2) {
-            resultsBox.hidden = true;
-            resultsBox.innerHTML = '';
-            hiddenValue.value = '';
-            return;
-        }
-
-        debounceTimer = setTimeout(async () => {
-            try {
-                const response = await fetch(`busca-registros.php?tipo=pet&q=${encodeURIComponent(query)}`);
-                if (!response.ok) throw new Error('Erro na requisição');
-
-                const data = await response.json();
-                resultsBox.innerHTML = '';
-
-                if (data.length === 0) {
-                    resultsBox.innerHTML = '<div class="search-picker-no-results" style="padding: 10px; font-size: 0.875rem; color: #666;">Nenhum pet encontrado</div>';
-                } else {
-                    data.forEach(item => {
-                        const itemDiv = document.createElement('div');
-                        itemDiv.className = 'search-picker-item';
-                        itemDiv.style.cursor = 'pointer';
-                        itemDiv.style.padding = '8px 12px';
-                        itemDiv.textContent = item.label;
-
-                        itemDiv.addEventListener('click', () => {
-                            input.value = item.label;
-                            hiddenValue.value = item.id;
-                            resultsBox.hidden = true;
-
-                            // Dispara evento para atualização automática de pacotes e saldo de débitos
-                            picker.dispatchEvent(new CustomEvent('search-picker:selected', { detail: item }));
-                        });
-
-                        resultsBox.appendChild(itemDiv);
-                    });
-                }
-
-                resultsBox.hidden = false;
-            } catch (error) {
-                console.error('Erro ao consultar pets:', error);
-                // HEURÍSTICA 9: antes o erro só ia para o console; agora o usuário vê o que aconteceu.
-                resultsBox.innerHTML = '<div class="search-picker-empty" role="alert" style="padding: 8px 12px; color: #b91c1c;">Não foi possível buscar pets agora. Verifique a conexão e digite novamente.</div>';
-                resultsBox.hidden = false;
-            }
-        }, 300);
-    });
-
-    // Oculta caixa de resultados ao clicar fora do componente
-    document.addEventListener('click', (event) => {
-        if (!picker.contains(event.target)) {
-            resultsBox.hidden = true;
-        }
-    });
-};
-
-// Executa a inicialização do seletor
-setupPetSearchPicker();
 </script>
 
 <?php require __DIR__ . '/../includes/rodape.php'; ?>
-

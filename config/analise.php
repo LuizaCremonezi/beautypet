@@ -54,101 +54,88 @@ function analiseNomeMes(int $numero): string
  * Monta os numeros do topo do Dashboard referentes a um unico dia.
  * Cada indice do array devolvido alimenta um card da tela.
  */
-function resumoDoDia(PDO $pdo, string $data, ?int $petsSemRetornoPrecalculado = null): array
+function resumoDoDia(PDO $pdo, string $data): array
 {
-    $inicioDia = $data . ' 00:00:00';
-    $fimDia = (new DateTime($data))->modify('+1 day')->format('Y-m-d') . ' 00:00:00';
+    // Soma tudo o que foi lancado no fechamento daquele dia, ignorando a categoria financeira.
+    $stmt = $pdo->prepare(
+        "SELECT COALESCE(SUM(vt.valor_total_lancamento), 0) AS faturamento
+         FROM lancamentos_diarios l
+         JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
+         JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
+         JOIN servicos s ON s.id = l.servico_id
+         JOIN categorias_servico cs ON cs.id = s.categoria_id
+         WHERE f.data_fechamento = :data
+           AND LOWER(cs.nome) <> 'financeiro'"
+    );
+    // Executa a instrucao preparada enviando os parametros de forma separada e segura.
+    $stmt->execute([':data' => $data]);
+    // Armazena em "faturamento" o total financeiro do dia consultado.
+    $faturamento = (float) $stmt->fetchColumn();
 
-    // Uma única ida ao banco para os indicadores rápidos do dia.
-    // As faixas de data evitam ::date nas colunas e permitem uso dos índices.
+    // Conta quantos pets diferentes passaram pelo Beauty Pet no dia.
+    $stmt = $pdo->prepare(
+        "SELECT COUNT(DISTINCT a.pet_id)
+         FROM atendimentos a
+         WHERE a.data_hora_entrada::date = :data
+           AND a.status <> 'CANCELADO'"
+    );
+    // Executa a instrucao preparada enviando os parametros de forma separada e segura.
+    $stmt->execute([':data' => $data]);
+    // Armazena em "petsAtendidos" a quantidade de pets distintos atendidos no dia.
+    $petsAtendidos = (int) $stmt->fetchColumn();
+
+    // Separa quantos lancamentos do dia foram de banho e quantos foram de tosa.
     $stmt = $pdo->prepare(
         "SELECT
-            COALESCE((
-                SELECT SUM(
-                    l.valor_servico
-                    + COALESCE((
-                        SELECT SUM(la.valor)
-                        FROM lancamento_adicionais la
-                        WHERE la.lancamento_diario_id = l.id
-                    ), 0)
-                )
-                FROM lancamentos_diarios l
-                JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-                JOIN servicos s ON s.id = l.servico_id
-                JOIN categorias_servico cs ON cs.id = s.categoria_id
-                WHERE f.data_fechamento = :data_faturamento
-                  AND LOWER(cs.nome) <> 'financeiro'
-            ), 0) AS faturamento,
-
-            COALESCE((
-                SELECT COUNT(DISTINCT a.pet_id)
-                FROM atendimentos a
-                WHERE a.data_hora_entrada >= :inicio_atendimento
-                  AND a.data_hora_entrada < :fim_atendimento
-                  AND a.status <> 'CANCELADO'
-            ), 0) AS pets_atendidos,
-
-            COALESCE((
-                SELECT COUNT(*)
-                FROM lancamentos_diarios l
-                JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-                JOIN servicos s ON s.id = l.servico_id
-                WHERE f.data_fechamento = :data_banho
-                  AND s.nome ILIKE '%banho%'
-            ), 0) AS banhos,
-
-            COALESCE((
-                SELECT COUNT(*)
-                FROM lancamentos_diarios l
-                JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-                JOIN servicos s ON s.id = l.servico_id
-                WHERE f.data_fechamento = :data_tosa
-                  AND s.nome ILIKE '%tosa%'
-            ), 0) AS tosas,
-
-            COALESCE((
-                SELECT COUNT(*)
-                FROM agendamentos
-                WHERE status = 'SOLICITADO'
-            ), 0) AS agendamentos_pendentes"
+            COUNT(*) FILTER (WHERE s.nome ILIKE '%banho%') AS banhos,
+            COUNT(*) FILTER (WHERE s.nome ILIKE '%tosa%')  AS tosas
+         FROM lancamentos_diarios l
+         JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
+         JOIN servicos s ON s.id = l.servico_id
+         WHERE f.data_fechamento = :data"
     );
+    // Executa a instrucao preparada enviando os parametros de forma separada e segura.
+    $stmt->execute([':data' => $data]);
+    // Armazena a linha com as duas contagens de servico para uso logo abaixo.
+    $servicosDoDia = $stmt->fetch() ?: ['banhos' => 0, 'tosas' => 0];
 
-    $stmt->execute([
-        ':data_faturamento'   => $data,
-        ':inicio_atendimento' => $inicioDia,
-        ':fim_atendimento'    => $fimDia,
-        ':data_banho'         => $data,
-        ':data_tosa'          => $data,
-    ]);
+    // Conta as solicitacoes de agendamento que ainda aguardam resposta da equipe.
+    $stmt = $pdo->query(
+        "SELECT COUNT(*) FROM agendamentos WHERE status = 'SOLICITADO'"
+    );
+    // Armazena em "agendamentosPendentes" o total de solicitacoes em aberto.
+    $agendamentosPendentes = (int) $stmt->fetchColumn();
 
-    $linha = $stmt->fetch() ?: [];
+    // Conta quantos pets ativos estao afastados ha mais tempo do que o limite definido.
+    $stmt = $pdo->prepare(
+        "SELECT COUNT(*)
+         FROM (
+            SELECT p.id
+            FROM pets p
+            JOIN clientes c ON c.id = p.cliente_id
+            JOIN lancamentos_diarios l ON l.pet_id = p.id
+            JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
+            WHERE p.ativo = TRUE
+              AND c.ativo = TRUE
+            GROUP BY p.id
+            HAVING (CURRENT_DATE - MAX(f.data_fechamento)) >= :dias
+         ) AS afastados"
+    );
+    // Informa o valor como numero inteiro para que o banco compare com a diferenca de datas.
+    $stmt->bindValue(':dias', ANALISE_DIAS_SEM_RETORNO, PDO::PARAM_INT);
+    // Executa a instrucao preparada com o parametro ja vinculado.
+    $stmt->execute();
+    // Armazena em "petsSemRetorno" quantos pets estao sem voltar ao Beauty Pet.
+    $petsSemRetorno = (int) $stmt->fetchColumn();
 
-    // Fora do Dashboard, mantém compatibilidade calculando o total quando ele não veio pré-calculado.
-    if ($petsSemRetornoPrecalculado === null) {
-        $stmt = $pdo->prepare(
-            "SELECT COUNT(*)
-             FROM (
-                SELECT l.pet_id
-                FROM lancamentos_diarios l
-                JOIN pets p ON p.id = l.pet_id AND p.ativo = TRUE
-                JOIN clientes c ON c.id = p.cliente_id AND c.ativo = TRUE
-                JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-                GROUP BY l.pet_id
-                HAVING MAX(f.data_fechamento) <= CURRENT_DATE - CAST(:dias AS integer)
-             ) afastados"
-        );
-        $stmt->bindValue(':dias', ANALISE_DIAS_SEM_RETORNO, PDO::PARAM_INT);
-        $stmt->execute();
-        $petsSemRetornoPrecalculado = (int) $stmt->fetchColumn();
-    }
-
+    // Devolve todos os indicadores reunidos em um unico array.
     return [
-        'faturamento'            => (float) ($linha['faturamento'] ?? 0),
-        'pets_atendidos'         => (int) ($linha['pets_atendidos'] ?? 0),
-        'banhos'                 => (int) ($linha['banhos'] ?? 0),
-        'tosas'                  => (int) ($linha['tosas'] ?? 0),
-        'agendamentos_pendentes' => (int) ($linha['agendamentos_pendentes'] ?? 0),
-        'pets_sem_retorno'       => (int) $petsSemRetornoPrecalculado,
+        'faturamento'            => $faturamento,
+        'pets_atendidos'         => $petsAtendidos,
+        'banhos'                 => (int) $servicosDoDia['banhos'],
+        'tosas'                  => (int) $servicosDoDia['tosas'],
+        'agendamentos_pendentes' => $agendamentosPendentes,
+        'pets_sem_retorno'       => $petsSemRetorno,
     ];
 }
 
@@ -165,16 +152,10 @@ function faturamentoUltimosDias(PDO $pdo, int $dias = 7): array
     $stmt = $pdo->prepare(
         "SELECT
             f.data_fechamento AS dia,
-            COALESCE(SUM(
-                l.valor_servico
-                + COALESCE((
-                    SELECT SUM(la.valor)
-                    FROM lancamento_adicionais la
-                    WHERE la.lancamento_diario_id = l.id
-                ), 0)
-            ), 0) AS total
+            COALESCE(SUM(vt.valor_total_lancamento), 0) AS total
          FROM fechamentos_diarios f
          LEFT JOIN lancamentos_diarios l ON l.fechamento_diario_id = f.id
+         LEFT JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
          WHERE f.data_fechamento >= :inicio
          GROUP BY f.data_fechamento
          ORDER BY f.data_fechamento"
@@ -224,16 +205,10 @@ function evolucaoMensal(PDO $pdo, int $meses = 6): array
     $stmt = $pdo->prepare(
         "SELECT
             TO_CHAR(f.data_fechamento, 'YYYY-MM') AS mes,
-            COALESCE(SUM(
-                l.valor_servico
-                + COALESCE((
-                    SELECT SUM(la.valor)
-                    FROM lancamento_adicionais la
-                    WHERE la.lancamento_diario_id = l.id
-                ), 0)
-            ), 0) AS total
+            COALESCE(SUM(vt.valor_total_lancamento), 0) AS total
          FROM fechamentos_diarios f
          LEFT JOIN lancamentos_diarios l ON l.fechamento_diario_id = f.id
+         LEFT JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
          WHERE f.data_fechamento >= :inicio
          GROUP BY TO_CHAR(f.data_fechamento, 'YYYY-MM')
          ORDER BY mes"
@@ -308,10 +283,10 @@ function servicosMaisRealizados(PDO $pdo, int $dias = ANALISE_JANELA_PADRAO, int
  */
 function formasDePagamento(PDO $pdo, int $dias = 30): array
 {
+    // Define o primeiro dia da janela consultada.
     $inicio = analiseDataInicio($dias);
 
-    // Compara timestamp diretamente com a data inicial; o índice em data_hora_pagamento
-    // passa a poder ser usado sem conversão ::date em cada linha.
+    // Agrupa os pagamentos nao estornados por forma de recebimento.
     $stmt = $pdo->prepare(
         "SELECT
             fp.nome AS forma,
@@ -319,12 +294,14 @@ function formasDePagamento(PDO $pdo, int $dias = 30): array
          FROM pagamentos p
          JOIN formas_pagamento fp ON fp.id = p.forma_pagamento_id
          WHERE p.estornado = FALSE
-           AND p.data_hora_pagamento >= CAST(:inicio AS date)
+           AND p.data_hora_pagamento::date >= :inicio
          GROUP BY fp.nome
          ORDER BY total DESC"
     );
+    // Executa a instrucao preparada enviando os parametros de forma separada e segura.
     $stmt->execute([':inicio' => $inicio]);
 
+    // Devolve as formas de pagamento ordenadas da mais usada para a menos usada.
     return $stmt->fetchAll();
 }
 
@@ -334,26 +311,9 @@ function formasDePagamento(PDO $pdo, int $dias = 30): array
  */
 function atendimentosDoDia(PDO $pdo, string $data, int $limite = 8): array
 {
-    $inicioDia = $data . ' 00:00:00';
-    $fimDia = (new DateTime($data))->modify('+1 day')->format('Y-m-d') . ' 00:00:00';
-
-    // Primeiro escolhe somente os agendamentos do dia que serão exibidos.
-    // Depois calcula serviços e financeiro apenas desses registros.
+    // Busca os agendamentos do dia ja com o nome do pet, a raca, os servicos e o valor lancado.
     $stmt = $pdo->prepare(
-        "WITH agenda_dia AS MATERIALIZED (
-            SELECT
-                a.id,
-                a.pet_id,
-                a.data_hora_inicio,
-                a.status
-            FROM agendamentos a
-            WHERE a.data_hora_inicio >= :inicio
-              AND a.data_hora_inicio < :fim
-              AND a.status <> 'RECUSADO'
-            ORDER BY a.data_hora_inicio
-            LIMIT :limite
-         )
-         SELECT
+        "SELECT
             a.id,
             a.data_hora_inicio,
             a.status,
@@ -362,43 +322,48 @@ function atendimentosDoDia(PDO $pdo, string $data, int $limite = 8): array
             COALESCE(r.nome, e.nome) AS raca,
             COALESCE(itens.servicos, 'Serviço não informado') AS servicos,
             COALESCE(financeiro.valor, 0) AS valor
-         FROM agenda_dia a
+         FROM agendamentos a
          JOIN pets p ON p.id = a.pet_id
          JOIN especies e ON e.id = p.especie_id
          LEFT JOIN racas r ON r.id = p.raca_id
-
-         LEFT JOIN LATERAL (
-            SELECT STRING_AGG(s.nome, ' + ' ORDER BY s.nome) AS servicos
+         LEFT JOIN (
+            SELECT
+                ai.agendamento_id,
+                STRING_AGG(s.nome, ' + ' ORDER BY s.nome) AS servicos
             FROM agendamento_itens ai
             JOIN servicos s ON s.id = ai.servico_id
-            WHERE ai.agendamento_id = a.id
-         ) itens ON TRUE
-
-         LEFT JOIN LATERAL (
+            GROUP BY ai.agendamento_id
+         ) itens ON itens.agendamento_id = a.id
+         LEFT JOIN (
             SELECT
-                COALESCE(SUM(
-                    l.valor_servico
-                    + COALESCE((
-                        SELECT SUM(la.valor)
-                        FROM lancamento_adicionais la
-                        WHERE la.lancamento_diario_id = l.id
-                    ), 0)
-                ), 0) AS valor
+                atd.agendamento_id,
+                SUM(vt.valor_total_lancamento) AS valor
             FROM atendimentos atd
             JOIN lancamentos_diarios l ON l.atendimento_id = atd.id
-            WHERE atd.agendamento_id = a.id
-         ) financeiro ON TRUE
-
-         ORDER BY a.data_hora_inicio"
+            JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
+            WHERE atd.agendamento_id IS NOT NULL
+            GROUP BY atd.agendamento_id
+         ) financeiro ON financeiro.agendamento_id = a.id
+         WHERE a.data_hora_inicio::date = :data
+           AND a.status <> 'RECUSADO'
+         ORDER BY a.data_hora_inicio
+         LIMIT :limite"
     );
-
-    $stmt->bindValue(':inicio', $inicioDia);
-    $stmt->bindValue(':fim', $fimDia);
+    // Informa os valores um a um para poder definir o tipo inteiro do LIMIT.
+    $stmt->bindValue(':data', $data);
     $stmt->bindValue(':limite', $limite, PDO::PARAM_INT);
+    // Executa a instrucao preparada com os parametros ja vinculados.
     $stmt->execute();
 
+    // Devolve os atendimentos do dia em ordem de horario.
     return $stmt->fetchAll();
 }
+
+/* ============================================================================
+ * ANALISES DE PADRAO
+ * Sao estas as cinco consultas que a analise inteligente interpreta para gerar
+ * as observacoes e as sugestoes de promocao previstas na versao BETA.
+ * ==========================================================================*/
 
 /**
  * ANALISE 1: pets que estao ha mais tempo sem retornar ao Beauty Pet.
@@ -406,46 +371,32 @@ function atendimentosDoDia(PDO $pdo, string $data, int $limite = 8): array
  */
 function petsSemRetorno(PDO $pdo, int $diasMinimos = ANALISE_DIAS_SEM_RETORNO, int $limite = 10): array
 {
-    // A mesma consulta devolve a lista e o total geral via COUNT(*) OVER(),
-    // evitando repetir a agregação pesada no Dashboard.
+    // Agrupa os lancamentos por pet para descobrir a data da ultima passagem de cada um.
     $stmt = $pdo->prepare(
-        "WITH ultimas_visitas AS MATERIALIZED (
-            SELECT
-                l.pet_id,
-                MAX(f.data_fechamento) AS ultima_visita
-            FROM lancamentos_diarios l
-            JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-            GROUP BY l.pet_id
-         ),
-         afastados AS (
-            SELECT
-                p.id AS pet_id,
-                p.nome AS pet,
-                c.nome AS tutor,
-                u.ultima_visita,
-                (CURRENT_DATE - u.ultima_visita) AS dias_sem_retorno
-            FROM ultimas_visitas u
-            JOIN pets p ON p.id = u.pet_id
-            JOIN clientes c ON c.id = p.cliente_id
-            WHERE p.ativo = TRUE
-              AND c.ativo = TRUE
-              AND u.ultima_visita <= CURRENT_DATE - CAST(:dias AS integer)
-         )
-         SELECT
-            pet_id,
-            pet,
-            tutor,
-            ultima_visita,
-            dias_sem_retorno,
-            COUNT(*) OVER() AS total_afastados
-         FROM afastados
+        "SELECT
+            p.id AS pet_id,
+            p.nome AS pet,
+            c.nome AS tutor,
+            MAX(f.data_fechamento) AS ultima_visita,
+            (CURRENT_DATE - MAX(f.data_fechamento)) AS dias_sem_retorno
+         FROM pets p
+         JOIN clientes c ON c.id = p.cliente_id
+         JOIN lancamentos_diarios l ON l.pet_id = p.id
+         JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
+         WHERE p.ativo = TRUE
+           AND c.ativo = TRUE
+         GROUP BY p.id, p.nome, c.nome
+         HAVING (CURRENT_DATE - MAX(f.data_fechamento)) >= :dias
          ORDER BY dias_sem_retorno DESC
          LIMIT :limite"
     );
+    // Informa os valores um a um para poder definir os tipos inteiros.
     $stmt->bindValue(':dias', $diasMinimos, PDO::PARAM_INT);
     $stmt->bindValue(':limite', $limite, PDO::PARAM_INT);
+    // Executa a instrucao preparada com os parametros ja vinculados.
     $stmt->execute();
 
+    // Devolve os pets comecando pelo que esta afastado ha mais tempo.
     return $stmt->fetchAll();
 }
 
@@ -511,7 +462,7 @@ function horariosDeMenorMovimento(PDO $pdo, int $dias = ANALISE_JANELA_PADRAO): 
             EXTRACT(HOUR FROM a.data_hora_inicio)::int AS hora,
             COUNT(*) AS atendimentos
          FROM agendamentos a
-         WHERE a.data_hora_inicio >= CAST(:inicio AS date)
+         WHERE a.data_hora_inicio::date >= :inicio
            AND a.status IN ('CONFIRMADO', 'EM_ATENDIMENTO', 'CONCLUIDO')
          GROUP BY EXTRACT(HOUR FROM a.data_hora_inicio)
          ORDER BY atendimentos ASC"
@@ -807,16 +758,10 @@ function serieDiariaFaturamento(PDO $pdo, int $dias = ANALISE_JANELA_PADRAO): ar
             f.data_fechamento AS dia,
             EXTRACT(DOW FROM f.data_fechamento)::int AS dia_semana,
             COUNT(l.id) AS servicos,
-            COALESCE(SUM(
-                l.valor_servico
-                + COALESCE((
-                    SELECT SUM(la.valor)
-                    FROM lancamento_adicionais la
-                    WHERE la.lancamento_diario_id = l.id
-                ), 0)
-            ), 0) AS total
+            COALESCE(SUM(vt.valor_total_lancamento), 0) AS total
          FROM fechamentos_diarios f
          LEFT JOIN lancamentos_diarios l ON l.fechamento_diario_id = f.id
+         LEFT JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
          WHERE f.data_fechamento >= :inicio
          GROUP BY f.data_fechamento, EXTRACT(DOW FROM f.data_fechamento)
          ORDER BY f.data_fechamento"

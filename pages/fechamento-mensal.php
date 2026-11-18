@@ -270,83 +270,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     }
 }
 
-// Dados de cada dia.
-// A versão anterior consultava a view de fechamento diário inteira e agregava
-// lançamentos/pagamentos da base toda antes de filtrar o mês. Agora selecionamos
-// primeiro os fechamentos do período e calculamos somente o que pertence a eles.
+// Dados de cada dia. O resumo financeiro usa o mesmo fechamento diário já existente,
+// mas a quantidade de pets e serviços ignora o serviço financeiro "Pagar débito".
 $stmt = $pdo->prepare(
     "SELECT
-        f.id AS fechamento_diario_id,
-        f.data_fechamento,
-        f.status,
-        f.valor_abertura_caixa,
-        f.valor_dinheiro_contado AS dinheiro_contado,
-        COALESCE(lanc.total_adicionais, 0) AS total_adicionais,
-        COALESCE(lanc.total_comercializado, 0) AS total_comercializado,
+        v.*,
         COALESCE(op.quantidade_servicos, 0) AS quantidade_servicos_operacionais,
         COALESCE(op.quantidade_pets, 0) AS quantidade_pets_operacionais,
         COALESCE(pg_real.dinheiro, 0) AS pagamento_dinheiro_real,
         COALESCE(pg_real.pix, 0) AS pagamento_pix_real,
         COALESCE(pg_real.cartao, 0) AS pagamento_cartao_real,
-        COALESCE(pg_real.total_recebido, 0) AS pagamento_total_real,
-        COALESCE(mov.credito_utilizado, 0) AS credito_utilizado,
-        COALESCE(mov.debito_gerado, 0) AS debito_gerado,
-        COALESCE(mov.debito_pago, 0) AS debito_pago
-     FROM fechamentos_diarios f
-
-     LEFT JOIN LATERAL (
+        COALESCE(pg_real.total_recebido, 0) AS pagamento_total_real
+     FROM vw_fechamento_diario v
+     LEFT JOIN (
         SELECT
-            COALESCE(SUM(COALESCE(ad.total_adicionais, 0)), 0) AS total_adicionais,
-            COALESCE(SUM(l.valor_servico + COALESCE(ad.total_adicionais, 0)), 0) AS total_comercializado
-        FROM lancamentos_diarios l
-        LEFT JOIN LATERAL (
-            SELECT SUM(la.valor) AS total_adicionais
-            FROM lancamento_adicionais la
-            WHERE la.lancamento_diario_id = l.id
-        ) ad ON TRUE
-        WHERE l.fechamento_diario_id = f.id
-     ) lanc ON TRUE
-
-     LEFT JOIN LATERAL (
-        SELECT
+            l.fechamento_diario_id,
             COUNT(l.id) AS quantidade_servicos,
             COUNT(DISTINCT l.pet_id) AS quantidade_pets
         FROM lancamentos_diarios l
         JOIN servicos s ON s.id = l.servico_id
         JOIN categorias_servico cs ON cs.id = s.categoria_id
-        WHERE l.fechamento_diario_id = f.id
-          AND LOWER(cs.nome) <> 'financeiro'
-     ) op ON TRUE
-
-     LEFT JOIN LATERAL (
+        WHERE LOWER(cs.nome) <> 'financeiro'
+        GROUP BY l.fechamento_diario_id
+     ) op ON op.fechamento_diario_id = v.fechamento_diario_id
+     LEFT JOIN (
         SELECT
-            COALESCE(SUM(p.valor) FILTER (WHERE LOWER(fp.nome) = 'dinheiro'), 0) AS dinheiro,
-            COALESCE(SUM(p.valor) FILTER (WHERE LOWER(fp.nome) = 'pix'), 0) AS pix,
-            COALESCE(SUM(p.valor) FILTER (WHERE LOWER(fp.nome) LIKE 'cart%'), 0) AS cartao,
-            COALESCE(SUM(p.valor), 0) AS total_recebido
+            p.fechamento_diario_id,
+            SUM(CASE
+                WHEN LOWER(fp.nome) = 'dinheiro' THEN p.valor
+                ELSE 0
+            END) AS dinheiro,
+            SUM(CASE
+                WHEN LOWER(fp.nome) = 'pix' THEN p.valor
+                ELSE 0
+            END) AS pix,
+            SUM(CASE
+                WHEN LOWER(fp.nome) LIKE 'cart%' THEN p.valor
+                ELSE 0
+            END) AS cartao,
+            SUM(p.valor) AS total_recebido
         FROM pagamentos p
         JOIN formas_pagamento fp ON fp.id = p.forma_pagamento_id
-        WHERE p.fechamento_diario_id = f.id
-          AND p.estornado = FALSE
-     ) pg_real ON TRUE
-
-     LEFT JOIN LATERAL (
-        SELECT
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA'
-            ), 0) AS credito_utilizado,
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA'
-            ), 0) AS debito_gerado,
-            COALESCE(SUM(m.valor) FILTER (
-                WHERE m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA'
-            ), 0) AS debito_pago
-        FROM movimentacoes_cliente m
-        WHERE m.fechamento_diario_id = f.id
-     ) mov ON TRUE
-
-     WHERE f.data_fechamento BETWEEN ? AND ?
-     ORDER BY f.data_fechamento"
+        WHERE p.estornado = FALSE
+        GROUP BY p.fechamento_diario_id
+     ) pg_real ON pg_real.fechamento_diario_id = v.fechamento_diario_id
+     WHERE v.data_fechamento BETWEEN ? AND ?
+     ORDER BY v.data_fechamento"
 );
 // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
 $stmt->execute([$inicioMes, $fimMes]);
@@ -477,18 +446,12 @@ $stmt = $pdo->prepare(
         cs.nome AS categoria,
         COUNT(l.id) AS quantidade_lancamentos,
         COUNT(DISTINCT l.pet_id) AS quantidade_pets,
-        COALESCE(SUM(
-            l.valor_servico
-            + COALESCE((
-                SELECT SUM(la.valor)
-                FROM lancamento_adicionais la
-                WHERE la.lancamento_diario_id = l.id
-            ), 0)
-        ), 0) AS total_servico
+        COALESCE(SUM(vt.valor_total_lancamento), 0) AS total_servico
      FROM lancamentos_diarios l
      JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
      JOIN servicos s ON s.id = l.servico_id
      JOIN categorias_servico cs ON cs.id = s.categoria_id
+     JOIN vw_total_lancamento vt ON vt.lancamento_diario_id = l.id
      WHERE f.data_fechamento BETWEEN ? AND ?
        AND LOWER(cs.nome) <> 'financeiro'
      GROUP BY s.id, s.nome, cs.nome
@@ -549,28 +512,49 @@ require __DIR__ . '/../includes/topo.php';
         </div>
     <?php endif; ?>
 
-<div class="monthly-period-bar">
-        <!-- 1. Seta Esquerda -->
-        <a class="monthly-period-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaAnterior) ?>" aria-label="Mês anterior">
-            <i class="fa-solid fa-chevron-left"></i>
-        </a>
+<?php
+// ===== Dados da barra de período (título do mês e tag contextual) =====
+$mensCompetenciaAtual = date('Y-m');
+$mensTituloMes = nomeMesFechamento($mes) . ' de ' . $ano;
+$mensDiferencaMeses = (($ano - (int) date('Y')) * 12) + ($mes - (int) date('n'));
+$mensTagMes = [-1 => 'Mês passado', 0 => 'Mês atual', 1 => 'Próximo mês'][$mensDiferencaMeses] ?? '';
+$mensEhMesAtual = $competencia === $mensCompetenciaAtual;
+?>
 
-        <!-- 2. Calendário / Mês (Submete automaticamente ao selecionar) -->
-        <form method="get" action="fechamento-mensal.php" class="monthly-period-form">
-            <label for="monthlyPeriod">Escolher mês</label>
-            <input id="monthlyPeriod" name="mes" type="month" value="<?= escapar($competencia) ?>" onchange="this.form.submit()">
-        </form>
+<div class="monthly-datebar" id="monthlyDatebar" data-atual="<?= escapar($mensCompetenciaAtual) ?>">
+    <!-- Lado esquerdo: mês ativo em destaque + tag contextual -->
+    <div class="monthly-datebar-info">
+        <h2 class="monthly-datebar-title" id="monthlyTitulo"><?= escapar($mensTituloMes) ?></h2>
+        <span class="monthly-datebar-tag<?= $mensTagMes === 'Mês atual' ? ' is-atual' : '' ?>"
+              id="monthlyTag"
+              <?= $mensTagMes === '' ? 'hidden' : '' ?>><?= escapar($mensTagMes) ?></span>
+    </div>
 
-        <!-- 3. Seta Direita -->
-        <a class="monthly-period-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaSeguinte) ?>" aria-label="Mês seguinte">
-            <i class="fa-solid fa-chevron-right"></i>
-        </a>
+    <!-- Lado direito: controles agrupados -->
+    <div class="monthly-datebar-controls">
+        <!-- "Mês atual" só aparece quando o mês selecionado não é o mês corrente -->
+        <a class="monthly-datebar-current" id="monthlyBotaoAtual"
+           href="fechamento-mensal.php?mes=<?= escapar($mensCompetenciaAtual) ?>"
+           <?= $mensEhMesAtual ? 'hidden' : '' ?>>Mês atual</a>
 
-        <div class="monthly-period-title">
-            <small>Competência</small>
-            <strong><?= escapar(nomeMesFechamento($mes)) ?> de <?= $ano ?></strong>
+        <div class="monthly-datebar-group">
+            <a class="monthly-datebar-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaAnterior) ?>" aria-label="Mês anterior">
+                <i class="fa-solid fa-chevron-left"></i>
+            </a>
+
+            <!-- Seletor de mês (o JS envia o formulário ao mudar) -->
+            <form class="monthly-datebar-form" id="monthlyPeriodForm" method="get" action="fechamento-mensal.php">
+                <label class="monthly-datebar-label" for="monthlyPeriod">Escolher mês</label>
+                <input id="monthlyPeriod" name="mes" type="month" value="<?= escapar($competencia) ?>">
+                <span class="monthly-datebar-caret" aria-hidden="true">▾</span>
+            </form>
+
+            <a class="monthly-datebar-arrow" href="fechamento-mensal.php?mes=<?= escapar($competenciaSeguinte) ?>" aria-label="Mês seguinte">
+                <i class="fa-solid fa-chevron-right"></i>
+            </a>
         </div>
     </div>
+</div>
 
     <!-- Inicia uma seção visual que agrupa informações relacionadas desta página. -->
     <section class="monthly-sheet-card">
@@ -826,6 +810,72 @@ require __DIR__ . '/../includes/topo.php';
         </form>
     </div>
 </div>
+
+<!-- Script da barra de período: texto do mês, tag e botão "Mês atual" -->
+<script>
+(() => {
+    const periodoInput = document.querySelector('#monthlyPeriod');
+    const periodoForm = document.querySelector('#monthlyPeriodForm');
+    const barra = document.querySelector('#monthlyDatebar');
+    const tituloMes = document.querySelector('#monthlyTitulo');
+    const tagMes = document.querySelector('#monthlyTag');
+    const botaoAtual = document.querySelector('#monthlyBotaoAtual');
+
+    if (!periodoInput || !periodoForm || !barra) return;
+
+    const MESES = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+    const atualISO = barra.dataset.atual || '';
+
+    // Lê "AAAA-MM" e valida o mês
+    const lerMes = (valor) => {
+        const partes = /^(\d{4})-(\d{2})$/.exec(valor || '');
+        if (!partes) return null;
+        const ano = Number(partes[1]);
+        const mes = Number(partes[2]);
+        return mes >= 1 && mes <= 12 ? { ano, mes } : null;
+    };
+
+    const tagDoMes = (valor) => {
+        const m = lerMes(valor);
+        const atual = lerMes(atualISO);
+        if (!m || !atual) return '';
+        const diferenca = ((m.ano - atual.ano) * 12) + (m.mes - atual.mes);
+        return { '-1': 'Mês passado', '0': 'Mês atual', '1': 'Próximo mês' }[String(diferenca)] || '';
+    };
+
+    const atualizarBarraPeriodo = () => {
+        const valor = periodoInput.value;
+        const m = lerMes(valor);
+        if (!m) return;
+
+        tituloMes.textContent = `${MESES[m.mes - 1]} de ${m.ano}`;
+
+        const tag = tagDoMes(valor);
+        tagMes.textContent = tag;
+        tagMes.hidden = !tag;
+        tagMes.classList.toggle('is-atual', tag === 'Mês atual');
+
+        // "Mês atual" só aparece quando o mês selecionado é diferente do mês corrente
+        if (botaoAtual) botaoAtual.hidden = valor === atualISO;
+    };
+
+    // Clicar em qualquer área do seletor abre o calendário de meses na hora
+    periodoForm.addEventListener('click', () => {
+        try {
+            periodoInput.showPicker();
+        } catch (erro) {
+            // Navegador sem showPicker: o input nativo cuida sozinho
+        }
+    });
+
+    // Ao mudar o mês: atualiza o texto na hora e carrega o fechamento do mês
+    periodoInput.addEventListener('change', () => {
+        if (!lerMes(periodoInput.value)) return; // ignora mês incompleto
+        atualizarBarraPeriodo();
+        periodoForm.submit();
+    });
+})();
+</script>
 
 <!-- Script responsável pelas interações desta parte da página no navegador. -->
 <script>

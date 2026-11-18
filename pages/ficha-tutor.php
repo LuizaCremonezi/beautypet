@@ -1,6 +1,10 @@
 <?php
-
-// Carrega as configurações do sistema e a conexão com o banco de dados.
+/**
+ * ARQUIVO: ficha-tutor.php
+ * RESPONSABILIDADE: Ficha detalhada do tutor.
+ * Carrega dados cadastrais, pets vinculados, métricas financeiras e histórico de atendimentos.
+ * Inclui também a lógica de exclusão restrita a administradores (Alteração #4).
+ */
 require __DIR__ . '/../config/config.php';
 
 // Valida o ID do tutor recebido por parâmetro na URL
@@ -11,8 +15,45 @@ if (!$id) {
     exit;
 }
 
-// Consulta principal otimizada: as métricas são calculadas somente para este tutor.
-$sqlTutor = <<<'SQL'
+// Obtém o usuário atual para checar se é ADMINISTRADOR (Controle de Acesso da Alteração #4)
+$usuarioAtual = obterUsuarioAtual($pdo);
+$ehAdministrador = (($usuarioAtual['perfil'] ?? null) === 'ADMINISTRADOR');
+
+// ---------------------------------------------------------------------------
+// Processamento da Exclusão do Tutor (Backend - Alteração #4)
+// ---------------------------------------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['acao'] ?? '') === 'excluir_tutor') {
+    if (!$ehAdministrador) {
+        header('Location: ficha-tutor.php?id=' . $id . '&erro=permissao');
+        exit;
+    }
+
+    try {
+        // Verifica se existem pets vinculados ou restrições de chave estrangeira
+        $stmtPets = $pdo->prepare('SELECT COUNT(*) FROM pets WHERE cliente_id = :id AND ativo = TRUE');
+        $stmtPets->execute([':id' => $id]);
+        $temPetsAtivos = (int) $stmtPets->fetchColumn();
+
+        if ($temPetsAtivos > 0) {
+            header('Location: ficha-tutor.php?id=' . $id . '&erro=possui_pets');
+            exit;
+        }
+
+        // Exclusão segura utilizando Prepared Statement
+        $stmtDel = $pdo->prepare('UPDATE clientes SET ativo = FALSE WHERE id = :id');
+        $stmtDel->execute([':id' => $id]);
+
+        header('Location: fichas-tutores.php?deletado=1');
+        exit;
+    } catch (Throwable $e) {
+        error_log('[BeautyPet] Erro ao excluir tutor: ' . $e->getMessage());
+        header('Location: ficha-tutor.php?id=' . $id . '&erro=conexao');
+        exit;
+    }
+}
+
+// Consulta principal dos dados do perfil e métricas financeiras do tutor
+$sqlTutor = '
     SELECT
         c.*,
         COALESCE(p.total_pets, 0)        AS total_pets,
@@ -21,50 +62,31 @@ $sqlTutor = <<<'SQL'
         COALESCE(s.saldo_debito, 0.00)  AS saldo_debito
     FROM clientes c
 
-    LEFT JOIN LATERAL (
-        SELECT COUNT(*) AS total_pets
-        FROM pets p
-        WHERE p.cliente_id = c.id
-          AND p.ativo = TRUE
-    ) p ON TRUE
-
-    LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(
-            l.valor_servico
-            + COALESCE((
-                SELECT SUM(la.valor)
-                FROM lancamento_adicionais la
-                WHERE la.lancamento_diario_id = l.id
-            ), 0)
-        ), 0) AS total_gasto
-        FROM pets p2
-        JOIN lancamentos_diarios l ON l.pet_id = p2.id
-        WHERE p2.cliente_id = c.id
-    ) g ON TRUE
-
-    LEFT JOIN LATERAL (
+    LEFT JOIN (
         SELECT
-            COALESCE(SUM(
-                CASE
-                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                    ELSE 0
-                END
-            ), 0.00) AS saldo_credito,
-            COALESCE(SUM(
-                CASE
-                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                    ELSE 0
-                END
-            ), 0.00) AS saldo_debito
-        FROM movimentacoes_cliente m
-        WHERE m.cliente_id = c.id
-    ) s ON TRUE
+            cliente_id,
+            COUNT(*) AS total_pets
+        FROM pets
+        WHERE ativo = TRUE
+        GROUP BY cliente_id
+    ) p
+        ON p.cliente_id = c.id
+
+    LEFT JOIN (
+        SELECT
+            cliente_id,
+            SUM(total_gasto) AS total_gasto
+        FROM vw_gastos_cliente_mes
+        GROUP BY cliente_id
+    ) g
+        ON g.cliente_id = c.id
+
+    LEFT JOIN vw_saldo_cliente s
+        ON s.cliente_id = c.id
 
     WHERE c.id = :id
       AND c.ativo = TRUE
-SQL;
+';
 
 $stmt = $pdo->prepare($sqlTutor);
 $stmt->execute([':id' => $id]);
@@ -75,8 +97,7 @@ if (!$tutor) {
     exit;
 }
 
-// Consulta os pets ativos vinculados ao tutor selecionado.
-// Pacotes são agregados somente para cada pet deste tutor.
+// Consulta os pets ativos vinculados ao tutor selecionado
 $sqlPets = <<<'SQL'
     SELECT
         p.id,
@@ -90,32 +111,25 @@ $sqlPets = <<<'SQL'
         COALESCE(pkg.creditos_restantes, 0) AS creditos_restantes,
         pkg.resumo_pacotes
     FROM pets p
-    JOIN especies e ON e.id = p.especie_id
-    LEFT JOIN racas r ON r.id = p.raca_id
-
-    LEFT JOIN LATERAL (
+    JOIN especies e
+        ON e.id = p.especie_id
+    LEFT JOIN racas r
+        ON r.id = p.raca_id
+    LEFT JOIN (
         SELECT
+            pet_id,
             COUNT(*) AS pacotes_ativos,
-            COALESCE(SUM(x.creditos_restantes), 0) AS creditos_restantes,
+            SUM(creditos_restantes) AS creditos_restantes,
             STRING_AGG(
-                CONCAT(x.pacote, ': ', x.creditos_restantes, ' restante(s)'),
-                ', ' ORDER BY x.pacote
+                CONCAT(pacote, ': ', creditos_restantes, ' restante(s)'),
+                ', ' ORDER BY pacote
             ) AS resumo_pacotes
-        FROM (
-            SELECT
-                pp.id,
-                pa.nome AS pacote,
-                pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_restantes
-            FROM pet_pacotes pp
-            JOIN pacotes pa ON pa.id = pp.pacote_id
-            LEFT JOIN lancamentos_diarios l ON l.pet_pacote_id = pp.id
-            WHERE pp.pet_id = p.id
-              AND pp.status = 'ATIVO'
-            GROUP BY pp.id, pa.nome, pp.quantidade_creditos
-            HAVING pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) > 0
-        ) x
-    ) pkg ON TRUE
-
+        FROM vw_saldo_pacotes
+        WHERE status = 'ATIVO'
+          AND creditos_restantes > 0
+        GROUP BY pet_id
+    ) pkg
+        ON pkg.pet_id = p.id
     WHERE p.cliente_id = :cliente_id
       AND p.ativo = TRUE
     ORDER BY p.nome
@@ -131,7 +145,7 @@ $paginaHistoricoAtual = max(1, (int) ($_GET['pagina_historico'] ?? 1));
 $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 
 // Contagem total de lançamentos do histórico do tutor
-$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM lancamentos_diarios l JOIN pets p ON p.id = l.pet_id WHERE p.cliente_id = :cliente_id');
+$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM vw_historico_cliente WHERE cliente_id = :cliente_id');
 $stmtCountHist->execute([':cliente_id' => $id]);
 $totalRegistrosHistorico = (int) $stmtCountHist->fetchColumn();
 $totalPaginasHistorico = max(1, ceil($totalRegistrosHistorico / $itensHistoricoPorPagina));
@@ -141,69 +155,54 @@ if ($paginaHistoricoAtual > $totalPaginasHistorico) {
     $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 }
 
-// Consulta o histórico financeiro do tutor paginado.
-// Pagamentos e movimentos são agregados somente para os lançamentos desta página.
-$sqlHistorico = <<<'SQL'
+// Consulta o histórico financeiro do tutor paginado
+$sqlHistorico = '
     SELECT
-        c.id AS cliente_id,
-        c.nome AS cliente,
-        p.id AS pet_id,
-        p.nome AS pet,
-        f.data_fechamento,
-        l.id AS lancamento_diario_id,
-        s.nome AS servico,
-        l.descricao,
-        l.valor_servico,
-        COALESCE(ad.total_adicionais, 0) AS total_adicionais,
-        l.valor_servico + COALESCE(ad.total_adicionais, 0) AS valor_total,
+        h.*,
         COALESCE(
-            NULLIF(CONCAT_WS(' + ', pg.formas, mov.movimentos), ''),
-            'Não informado'
+            NULLIF(CONCAT_WS(\' + \', pg.formas, mov.movimentos), \'\'),
+            \'Não informado\'
         ) AS forma_pagamento
-    FROM lancamentos_diarios l
-    JOIN pets p ON p.id = l.pet_id
-    JOIN clientes c ON c.id = p.cliente_id
-    JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-    JOIN servicos s ON s.id = l.servico_id
+    FROM vw_historico_cliente h
 
-    LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
-        FROM lancamento_adicionais la
-        WHERE la.lancamento_diario_id = l.id
-    ) ad ON TRUE
+    LEFT JOIN (
+        SELECT
+            p.lancamento_diario_id,
+            STRING_AGG(DISTINCT fp.nome, \' + \' ORDER BY fp.nome) AS formas
+        FROM pagamentos p
+        JOIN formas_pagamento fp
+            ON fp.id = p.forma_pagamento_id
+        WHERE p.estornado = FALSE
+          AND p.lancamento_diario_id IS NOT NULL
+        GROUP BY p.lancamento_diario_id
+    ) pg
+        ON pg.lancamento_diario_id = h.lancamento_diario_id
 
-    LEFT JOIN LATERAL (
-        SELECT STRING_AGG(DISTINCT fp.nome, ' + ' ORDER BY fp.nome) AS formas
-        FROM pagamentos pag
-        JOIN formas_pagamento fp ON fp.id = pag.forma_pagamento_id
-        WHERE pag.estornado = FALSE
-          AND pag.lancamento_diario_id = l.id
-    ) pg ON TRUE
+    LEFT JOIN (
+        SELECT
+            lancamento_diario_id,
+            STRING_AGG(
+                DISTINCT CASE
+                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'SAIDA\'
+                        THEN \'Crédito utilizado\'
+                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'ENTRADA\'
+                        THEN \'Crédito gerado\'
+                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'ENTRADA\'
+                        THEN \'Débito pendente\'
+                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'SAIDA\'
+                        THEN \'Débito pago\'
+                END,
+                \' + \'
+            ) AS movimentos
+        FROM movimentacoes_cliente
+        WHERE lancamento_diario_id IS NOT NULL
+        GROUP BY lancamento_diario_id
+    ) mov
+        ON mov.lancamento_diario_id = h.lancamento_diario_id
 
-    LEFT JOIN LATERAL (
-        SELECT STRING_AGG(
-            DISTINCT CASE
-                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN 'Crédito utilizado'
-                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN 'Crédito gerado'
-                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN 'Débito pendente'
-                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN 'Débito pago'
-            END,
-            ' + '
-        ) AS movimentos
-        FROM movimentacoes_cliente m
-        WHERE m.lancamento_diario_id = l.id
-    ) mov ON TRUE
-
-    WHERE p.cliente_id = :cliente_id
-    ORDER BY f.data_fechamento DESC, l.id DESC
-    LIMIT __LIMIT__ OFFSET __OFFSET__
-SQL;
-
-$sqlHistorico = str_replace(
-    ['__LIMIT__', '__OFFSET__'],
-    [(string) $itensHistoricoPorPagina, (string) $offsetHistorico],
-    $sqlHistorico
-);
+    WHERE h.cliente_id = :cliente_id
+    ORDER BY h.data_fechamento DESC, h.lancamento_diario_id DESC
+    LIMIT ' . $itensHistoricoPorPagina . ' OFFSET ' . $offsetHistorico;
 
 $stmt = $pdo->prepare($sqlHistorico);
 $stmt->execute([':cliente_id' => $id]);
@@ -228,10 +227,20 @@ require __DIR__ . '/../includes/topo.php';
         <div class="message success detail-edit-message">Dados atualizados com sucesso!</div>
     <?php endif; ?>
 
+    <?php if (isset($_GET['erro'])): ?>
+        <div class="message error detail-edit-message">
+            <?php
+                if ($_GET['erro'] === 'possui_pets') echo 'Não é possível excluir este tutor pois ele possui pets ativos vinculados.';
+                elseif ($_GET['erro'] === 'permissao') echo 'Você não possui permissão de Administrador para realizar esta exclusão.';
+                else echo 'Não foi possível realizar a exclusão. Tente novamente.';
+            ?>
+        </div>
+    <?php endif; ?>
+
     <!-- Layout principal contendo perfil do tutor e resumo lateral -->
     <div class="detail-layout">
 
-        <!-- Card com os dados pessoais do tutor e botão de edição integrado -->
+        <!-- Card com os dados pessoais do tutor e botões de edição/exclusão integrados -->
         <section class="detail-card tutor-profile-card">
 
             <div>
@@ -299,11 +308,20 @@ require __DIR__ . '/../includes/topo.php';
                 </div>
             </div>
 
-            <!-- Botão de edição posicionado no canto inferior direito do card -->
-            <div class="tutor-action-wrapper">
+            <!-- Botões de ação alinhados lado a lado (Editar e Excluir com o design customizado .danger) -->
+            <div class="tutor-action-wrapper" style="display: flex; gap: 10px; align-items: center; justify-content: flex-end;">
                 <a class="detail-edit-button" href="cadastro-tutor.php?editar=<?= (int) $id ?>">
                     Editar tutor
                 </a>
+
+                <?php if ($ehAdministrador): ?>
+                    <form method="post" id="formExcluirTutor" onsubmit="return confirm('Tem certeza que deseja excluir este tutor? Esta ação não poderá ser desfeita e removerá os acessos vinculados.');" style="margin: 0;">
+                        <input type="hidden" name="acao" value="excluir_tutor">
+                        <button type="submit" class="detail-edit-button icon-action-button danger" style="background: #ffe4e4; color: #b21f1f; border: 1px solid #f0cbc8;">
+                            Excluir
+                        </button>
+                    </form>
+                <?php endif; ?>
             </div>
 
         </section>

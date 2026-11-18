@@ -10,6 +10,10 @@
  *   - Tutores com débito pendente e total de créditos (visão vw_saldo_cliente, a mesma da ficha do tutor).
  *
  * Os lançamentos continuam sendo feitos no Fechamento diário; o detalhamento por dia fica no Fechamento mensal.
+ *
+ * [BP-PADRONIZAÇÃO] Visual alinhado com a Agenda e o Dashboard:
+ *   - Barra de navegação de mês igual à da agenda (Hoje, seta anterior, seletor, seta seguinte, mês por extenso).
+ *   - Cards de resumo no mesmo padrão dos KPIs do Dashboard (ícone, valor e rótulo).
  * Cada consulta tem seu próprio try/catch: se uma falhar, o restante da página continua aparecendo.
  */
 require __DIR__ . '/../config/config.php';
@@ -24,6 +28,13 @@ $inicioProximoMes = date('Y-m-d', strtotime($inicioMes . ' +1 month'));
 
 $nomesMeses = [1 => 'janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
 $rotuloMes = $nomesMeses[(int) substr($mesSelecionado, 5, 2)] . ' de ' . substr($mesSelecionado, 0, 4);
+
+// Navegação entre meses (setas da barra, igual à agenda faz com os dias).
+$mesAtual = date('Y-m');
+$mesAnterior = date('Y-m', strtotime($inicioMes . ' -1 month'));
+$mesSeguinte = date('Y-m', strtotime($inicioMes . ' +1 month'));
+$podeAvancar = $mesSeguinte <= $mesAtual; // o filtro nunca vai além do mês atual
+$rotuloMesTitulo = ucfirst($rotuloMes); // todos os meses começam com letra ASCII, então ucfirst basta (sem depender de mbstring)
 
 $errosConsulta = [];
 $periodo = [':inicio' => $inicioMes, ':fim' => $inicioProximoMes];
@@ -71,71 +82,22 @@ $tutoresComDebito = [];
 $totalDebitos = 0.0;
 $totalCreditos = 0.0;
 try {
-    // Uma única consulta calcula os saldos atuais e devolve os 15 maiores débitos.
-    // Os totais gerais vêm por window function, evitando consultar vw_saldo_cliente duas vezes.
-    $stmt = $pdo->query(
-        "WITH saldos AS MATERIALIZED (
-            SELECT
-                m.cliente_id,
-                COALESCE(SUM(
-                    CASE
-                        WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                        WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                        ELSE 0
-                    END
-                ), 0.00) AS saldo_credito,
-                COALESCE(SUM(
-                    CASE
-                        WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                        WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                        ELSE 0
-                    END
-                ), 0.00) AS saldo_debito
-            FROM movimentacoes_cliente m
-            GROUP BY m.cliente_id
-         ),
-         saldos_com_totais AS (
-            SELECT
-                s.*,
-                SUM(s.saldo_debito) OVER() AS total_debitos,
-                SUM(s.saldo_credito) OVER() AS total_creditos
-            FROM saldos s
-         )
-         SELECT
-            c.id,
-            c.nome,
-            c.telefone_principal,
-            s.saldo_debito,
-            s.total_debitos,
-            s.total_creditos
-         FROM saldos_com_totais s
+    $totais = $pdo->query(
+        'SELECT COALESCE(SUM(saldo_debito), 0) AS debitos, COALESCE(SUM(saldo_credito), 0) AS creditos
+         FROM vw_saldo_cliente'
+    )->fetch() ?: [];
+    $totalDebitos = (float) ($totais['debitos'] ?? 0);
+    $totalCreditos = (float) ($totais['creditos'] ?? 0);
+
+    $tutoresComDebito = $pdo->query(
+        'SELECT c.id, c.nome, c.telefone_principal, s.saldo_debito
+         FROM vw_saldo_cliente s
          JOIN clientes c ON c.id = s.cliente_id
          WHERE s.saldo_debito > 0
            AND c.ativo = TRUE
          ORDER BY s.saldo_debito DESC
-         LIMIT 15"
-    );
-
-    $tutoresComDebito = $stmt->fetchAll();
-
-    if ($tutoresComDebito) {
-        $totalDebitos = (float) ($tutoresComDebito[0]['total_debitos'] ?? 0);
-        $totalCreditos = (float) ($tutoresComDebito[0]['total_creditos'] ?? 0);
-    } else {
-        // Se não há débito positivo, ainda precisamos do total de créditos.
-        $stmt = $pdo->query(
-            "SELECT
-                COALESCE(SUM(
-                    CASE
-                        WHEN tipo_saldo = 'CREDITO' AND operacao = 'ENTRADA' THEN valor
-                        WHEN tipo_saldo = 'CREDITO' AND operacao = 'SAIDA' THEN -valor
-                        ELSE 0
-                    END
-                ), 0.00) AS creditos
-             FROM movimentacoes_cliente"
-        );
-        $totalCreditos = (float) $stmt->fetchColumn();
-    }
+         LIMIT 15'
+    )->fetchAll();
 } catch (Throwable $erro) {
     $errosConsulta[] = 'saldos';
 }
@@ -152,12 +114,6 @@ require __DIR__ . '/../includes/topo.php';
             <h1>Financeiro</h1>
             <small>Resumo de <?= escapar($rotuloMes) ?> · somente consulta</small>
         </div>
-
-        <form class="finance-filter" method="get" action="financeiro.php">
-            <label for="mes">Mês</label>
-            <input id="mes" name="mes" type="month" value="<?= escapar($mesSelecionado) ?>" max="<?= date('Y-m') ?>">
-            <button class="save-button" type="submit">Ver</button>
-        </form>
     </div>
 
     <?php if ($errosConsulta): ?>
@@ -166,28 +122,68 @@ require __DIR__ . '/../includes/topo.php';
         </div>
     <?php endif; ?>
 
-    <!-- Números principais do mês -->
-    <div class="finance-summary">
-        <div class="finance-card income">
-            <small>Entradas do mês</small>
-            <strong><?= escapar(formatarMoeda($totalEntradas)) ?></strong>
+    <!-- Barra de navegação de mês: mesmo padrão da barra de data da Agenda. -->
+    <div class="google-calendar-toolbar">
+        <!-- 1. Atalho para o mês atual -->
+        <a class="calendar-today-button" href="financeiro.php?mes=<?= escapar($mesAtual) ?>" aria-label="Voltar para o mês atual">Hoje</a>
+
+        <!-- 2. Seta para o mês anterior -->
+        <div class="calendar-nav-buttons">
+            <a href="financeiro.php?mes=<?= escapar($mesAnterior) ?>" aria-label="Mês anterior">
+                <i class="fa-solid fa-chevron-left"></i>
+            </a>
         </div>
-        <div class="finance-card expense">
-            <small>Despesas do caixa</small>
-            <strong><?= escapar(formatarMoeda($totalDespesas)) ?></strong>
+
+        <!-- 3. Seletor de mês (envia sozinho ao alterar) -->
+        <form class="calendar-date-form" method="get" action="financeiro.php">
+            <label for="mes">Mês</label>
+            <input id="mes" name="mes" type="month" value="<?= escapar($mesSelecionado) ?>" max="<?= escapar($mesAtual) ?>" onchange="this.form.submit()">
+        </form>
+
+        <!-- 4. Seta para o mês seguinte (desativada no mês atual, pois não há dados futuros) -->
+        <div class="calendar-nav-buttons">
+            <?php if ($podeAvancar): ?>
+                <a href="financeiro.php?mes=<?= escapar($mesSeguinte) ?>" aria-label="Mês seguinte">
+                    <i class="fa-solid fa-chevron-right"></i>
+                </a>
+            <?php else: ?>
+                <a class="is-disabled" aria-disabled="true" aria-label="Mês seguinte (indisponível)">
+                    <i class="fa-solid fa-chevron-right"></i>
+                </a>
+            <?php endif; ?>
         </div>
-        <div class="finance-card <?= $resultadoMes >= 0 ? 'income' : 'expense' ?>">
-            <small>Resultado (entradas − despesas)</small>
-            <strong><?= escapar(formatarMoeda($resultadoMes)) ?></strong>
-        </div>
-        <div class="finance-card">
-            <small>A receber (débitos de tutores)</small>
-            <strong><?= escapar(formatarMoeda($totalDebitos)) ?></strong>
-        </div>
-        <div class="finance-card">
-            <small>Créditos de tutores</small>
-            <strong><?= escapar(formatarMoeda($totalCreditos)) ?></strong>
-        </div>
+
+        <!-- 5. Mês por extenso no canto direito -->
+        <strong class="calendar-date-title"><?= escapar($rotuloMesTitulo) ?></strong>
+    </div>
+
+    <!-- Números principais do mês (mesmo padrão dos KPIs do Dashboard) -->
+    <div class="kpi-grid">
+        <article class="kpi-card kpi-card-verde">
+            <span class="kpi-icone kpi-icone-verde"><i class="fa-solid fa-arrow-trend-up"></i></span>
+            <strong class="kpi-valor"><?= escapar(formatarMoeda($totalEntradas)) ?></strong>
+            <small class="kpi-rotulo">Entradas do mês</small>
+        </article>
+        <article class="kpi-card kpi-card-alerta">
+            <span class="kpi-icone kpi-icone-vermelho"><i class="fa-solid fa-receipt"></i></span>
+            <strong class="kpi-valor"><?= escapar(formatarMoeda($totalDespesas)) ?></strong>
+            <small class="kpi-rotulo">Despesas do caixa</small>
+        </article>
+        <article class="kpi-card <?= $resultadoMes >= 0 ? 'kpi-card-verde' : 'kpi-card-alerta' ?>">
+            <span class="kpi-icone <?= $resultadoMes >= 0 ? 'kpi-icone-verde' : 'kpi-icone-vermelho' ?>"><i class="fa-solid fa-scale-balanced"></i></span>
+            <strong class="kpi-valor"><?= escapar(formatarMoeda($resultadoMes)) ?></strong>
+            <small class="kpi-rotulo">Resultado (entradas − despesas)</small>
+        </article>
+        <article class="kpi-card">
+            <span class="kpi-icone kpi-icone-amarelo"><i class="fa-solid fa-hand-holding-dollar"></i></span>
+            <strong class="kpi-valor"><?= escapar(formatarMoeda($totalDebitos)) ?></strong>
+            <small class="kpi-rotulo">A receber (débitos de tutores)</small>
+        </article>
+        <article class="kpi-card">
+            <span class="kpi-icone kpi-icone-azul"><i class="fa-solid fa-wallet"></i></span>
+            <strong class="kpi-valor"><?= escapar(formatarMoeda($totalCreditos)) ?></strong>
+            <small class="kpi-rotulo">Créditos de tutores</small>
+        </article>
     </div>
 
     <div class="finance-grid">
@@ -197,18 +193,20 @@ require __DIR__ . '/../includes/topo.php';
             <?php if (!$entradasPorForma): ?>
                 <p class="finance-empty">Nenhum pagamento registrado neste mês.</p>
             <?php else: ?>
-                <table class="finance-table">
-                    <thead><tr><th>Forma</th><th>Pagamentos</th><th>Total</th></tr></thead>
-                    <tbody>
-                        <?php foreach ($entradasPorForma as $linha): ?>
-                            <tr>
-                                <td><?= escapar($linha['forma']) ?></td>
-                                <td><?= (int) $linha['quantidade'] ?></td>
-                                <td><?= escapar(formatarMoeda($linha['total'])) ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+                <div class="finance-table-wrap">
+                    <table class="finance-table">
+                        <thead><tr><th>Forma</th><th>Pagamentos</th><th>Total</th></tr></thead>
+                        <tbody>
+                            <?php foreach ($entradasPorForma as $linha): ?>
+                                <tr>
+                                    <td><?= escapar($linha['forma']) ?></td>
+                                    <td><?= (int) $linha['quantidade'] ?></td>
+                                    <td><?= escapar(formatarMoeda($linha['total'])) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
             <?php endif; ?>
         </section>
 
@@ -218,18 +216,20 @@ require __DIR__ . '/../includes/topo.php';
             <?php if (!$tutoresComDebito): ?>
                 <p class="finance-empty">Nenhum tutor com débito. 🎉</p>
             <?php else: ?>
-                <table class="finance-table">
-                    <thead><tr><th>Tutor</th><th>Telefone</th><th>Débito</th></tr></thead>
-                    <tbody>
-                        <?php foreach ($tutoresComDebito as $tutor): ?>
-                            <tr>
-                                <td><a href="ficha-tutor.php?id=<?= (int) $tutor['id'] ?>"><?= escapar($tutor['nome']) ?></a></td>
-                                <td><?= escapar(formatarTelefone($tutor['telefone_principal'] ?? null)) ?></td>
-                                <td><?= escapar(formatarMoeda($tutor['saldo_debito'])) ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+                <div class="finance-table-wrap">
+                    <table class="finance-table">
+                        <thead><tr><th>Tutor</th><th>Telefone</th><th>Débito</th></tr></thead>
+                        <tbody>
+                            <?php foreach ($tutoresComDebito as $tutor): ?>
+                                <tr>
+                                    <td><a href="ficha-tutor.php?id=<?= (int) $tutor['id'] ?>"><?= escapar($tutor['nome']) ?></a></td>
+                                    <td><?= escapar(formatarTelefone($tutor['telefone_principal'] ?? null)) ?></td>
+                                    <td><?= escapar(formatarMoeda($tutor['saldo_debito'])) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
             <?php endif; ?>
         </section>
     </div>
@@ -240,19 +240,21 @@ require __DIR__ . '/../includes/topo.php';
         <?php if (!$despesas): ?>
             <p class="finance-empty">Nenhuma despesa registrada neste mês.</p>
         <?php else: ?>
-            <table class="finance-table">
-                <thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th></tr></thead>
-                <tbody>
-                    <?php foreach ($despesas as $despesa): ?>
-                        <tr>
-                            <td><?= escapar(date('d/m/Y', strtotime((string) $despesa['data_hora_despesa']))) ?></td>
-                            <td><?= escapar($despesa['descricao']) ?></td>
-                            <td><?= escapar($despesa['categoria'] ?: '—') ?></td>
-                            <td><?= escapar(formatarMoeda($despesa['valor'])) ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
+            <div class="finance-table-wrap">
+                <table class="finance-table">
+                    <thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Valor</th></tr></thead>
+                    <tbody>
+                        <?php foreach ($despesas as $despesa): ?>
+                            <tr>
+                                <td><?= escapar(date('d/m/Y', strtotime((string) $despesa['data_hora_despesa']))) ?></td>
+                                <td><?= escapar($despesa['descricao']) ?></td>
+                                <td><?= escapar($despesa['categoria'] ?: '—') ?></td>
+                                <td><?= escapar(formatarMoeda($despesa['valor'])) ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
         <?php endif; ?>
     </section>
 

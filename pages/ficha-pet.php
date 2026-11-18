@@ -3,6 +3,7 @@
  * ARQUIVO: ficha-pet.php
  * RESPONSABILIDADE: Ficha detalhada do pet.
  * Carrega dados cadastrais, tutor, pacotes e histórico de serviços/financeiro com paginação.
+ * Inclui também a lógica de exclusão restrita a administradores (Alteração #4).
  */
 require __DIR__ . '/../config/config.php';
 
@@ -14,9 +15,35 @@ if (!$id) {
     exit;
 }
 
-// Consulta otimizada do pet: saldo do tutor e gasto do pet são calculados
-// somente para os IDs envolvidos nesta ficha.
-$sqlPet = <<<'SQL'
+// Obtém o usuário atual para checar se é ADMINISTRADOR (Controle de Acesso da Alteração #4)
+$usuarioAtual = obterUsuarioAtual($pdo);
+$ehAdministrador = (($usuarioAtual['perfil'] ?? null) === 'ADMINISTRADOR');
+
+// ---------------------------------------------------------------------------
+// Processamento da Exclusão do Pet (Backend - Alteração #4)
+// ---------------------------------------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['acao'] ?? '') === 'excluir_pet') {
+    if (!$ehAdministrador) {
+        header('Location: ficha-pet.php?id=' . $id . '&erro=permissao');
+        exit;
+    }
+
+    try {
+        // Exclusão segura utilizando Prepared Statement
+        $stmtDel = $pdo->prepare('UPDATE pets SET ativo = FALSE WHERE id = :id');
+        $stmtDel->execute([':id' => $id]);
+
+        header('Location: fichas-pets.php?deletado=1');
+        exit;
+    } catch (Throwable $e) {
+        error_log('[BeautyPet] Erro ao excluir pet: ' . $e->getMessage());
+        header('Location: ficha-pet.php?id=' . $id . '&erro=conexao');
+        exit;
+    }
+}
+
+// Prepara uma consulta em "pets" para carregar os dados cadastrais e financeiros do pet.
+$sqlPet = '
     SELECT
         p.*,
         c.nome AS tutor,
@@ -27,46 +54,25 @@ $sqlPet = <<<'SQL'
         COALESCE(s.saldo_debito, 0.00)  AS saldo_debito_tutor,
         COALESCE(g.total_gasto, 0.00)   AS total_gasto
     FROM pets p
-    JOIN clientes c ON c.id = p.cliente_id
-    JOIN especies e ON e.id = p.especie_id
-    LEFT JOIN racas r ON r.id = p.raca_id
-
-    LEFT JOIN LATERAL (
+    JOIN clientes c
+        ON c.id = p.cliente_id
+    JOIN especies e
+        ON e.id = p.especie_id
+    LEFT JOIN racas r
+        ON r.id = p.raca_id
+    LEFT JOIN vw_saldo_cliente s
+        ON s.cliente_id = c.id
+    LEFT JOIN (
         SELECT
-            COALESCE(SUM(
-                CASE
-                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                    WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                    ELSE 0
-                END
-            ), 0.00) AS saldo_credito,
-            COALESCE(SUM(
-                CASE
-                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN m.valor
-                    WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN -m.valor
-                    ELSE 0
-                END
-            ), 0.00) AS saldo_debito
-        FROM movimentacoes_cliente m
-        WHERE m.cliente_id = c.id
-    ) s ON TRUE
-
-    LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(
-            l.valor_servico
-            + COALESCE((
-                SELECT SUM(la.valor)
-                FROM lancamento_adicionais la
-                WHERE la.lancamento_diario_id = l.id
-            ), 0)
-        ), 0) AS total_gasto
-        FROM lancamentos_diarios l
-        WHERE l.pet_id = p.id
-    ) g ON TRUE
-
+            pet_id,
+            SUM(valor_total_lancamento) AS total_gasto
+        FROM vw_total_lancamento
+        GROUP BY pet_id
+    ) g
+        ON g.pet_id = p.id
     WHERE p.id = :id
       AND p.ativo = TRUE
-SQL;
+';
 
 $stmt = $pdo->prepare($sqlPet);
 $stmt->execute([':id' => $id]);
@@ -77,32 +83,23 @@ if (!$pet) {
     exit;
 }
 
-// Carrega somente os pacotes deste pet e calcula os créditos utilizados diretamente.
-$sqlPacotes = <<<'SQL'
+// Carrega os pacotes ativos e com créditos restantes do pet.
+$sqlPacotes = '
     SELECT
-        pp.id AS pet_pacote_id,
-        pa.nome AS pacote,
-        pp.data_compra,
-        pp.data_validade,
-        pp.quantidade_creditos AS creditos_totais,
-        COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_utilizados,
-        pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) AS creditos_restantes,
-        pp.status
-    FROM pet_pacotes pp
-    JOIN pacotes pa ON pa.id = pp.pacote_id
-    LEFT JOIN lancamentos_diarios l ON l.pet_pacote_id = pp.id
-    WHERE pp.pet_id = :pet_id
-      AND pp.status = 'ATIVO'
-    GROUP BY
-        pp.id,
-        pa.nome,
-        pp.data_compra,
-        pp.data_validade,
-        pp.quantidade_creditos,
-        pp.status
-    HAVING pp.quantidade_creditos - COALESCE(SUM(l.creditos_pacote_usados), 0) > 0
-    ORDER BY pp.data_compra DESC
-SQL;
+        pet_pacote_id,
+        pacote,
+        data_compra,
+        data_validade,
+        creditos_totais,
+        creditos_utilizados,
+        creditos_restantes,
+        status
+    FROM vw_saldo_pacotes
+    WHERE pet_id = :pet_id
+      AND status = \'ATIVO\'
+      AND creditos_restantes > 0
+    ORDER BY data_compra DESC
+';
 
 $stmt = $pdo->prepare($sqlPacotes);
 $stmt->execute([':pet_id' => $id]);
@@ -122,7 +119,7 @@ $paginaHistoricoAtual = max(1, (int) ($_GET['pagina_historico'] ?? 1));
 $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 
 // Conta o total de registros no histórico deste pet para calcular as páginas.
-$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM lancamentos_diarios WHERE pet_id = :pet_id');
+$stmtCountHist = $pdo->prepare('SELECT COUNT(*) FROM vw_historico_pet WHERE pet_id = :pet_id');
 $stmtCountHist->execute([':pet_id' => $id]);
 $totalRegistrosHistorico = (int) $stmtCountHist->fetchColumn();
 $totalPaginasHistorico = max(1, ceil($totalRegistrosHistorico / $itensHistoricoPorPagina));
@@ -132,71 +129,54 @@ if ($paginaHistoricoAtual > $totalPaginasHistorico) {
     $offsetHistorico = ($paginaHistoricoAtual - 1) * $itensHistoricoPorPagina;
 }
 
-// Consulta o histórico do pet paginado, agregando pagamentos e movimentos
-// somente para os lançamentos que realmente aparecem nesta página.
-$sqlHistorico = <<<'SQL'
+// Consulta o histórico de atendimentos do pet com limite e offset aplicados.
+$sqlHistorico = '
     SELECT
-        p.id AS pet_id,
-        p.nome AS pet,
-        c.id AS cliente_id,
-        c.nome AS cliente,
-        f.data_fechamento,
-        l.id AS lancamento_diario_id,
-        l.atendimento_id,
-        s.id AS servico_id,
-        s.nome AS servico,
-        l.descricao,
-        l.valor_servico,
-        COALESCE(ad.total_adicionais, 0) AS total_adicionais,
-        l.valor_servico + COALESCE(ad.total_adicionais, 0) AS valor_total,
+        h.*,
         COALESCE(
-            NULLIF(CONCAT_WS(' + ', pg.formas, mov.movimentos), ''),
-            'Não informado'
+            NULLIF(CONCAT_WS(\' + \', pg.formas, mov.movimentos), \'\'),
+            \'Não informado\'
         ) AS forma_pagamento
-    FROM lancamentos_diarios l
-    JOIN pets p ON p.id = l.pet_id
-    JOIN clientes c ON c.id = p.cliente_id
-    JOIN fechamentos_diarios f ON f.id = l.fechamento_diario_id
-    JOIN servicos s ON s.id = l.servico_id
+    FROM vw_historico_pet h
 
-    LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(la.valor), 0) AS total_adicionais
-        FROM lancamento_adicionais la
-        WHERE la.lancamento_diario_id = l.id
-    ) ad ON TRUE
+    LEFT JOIN (
+        SELECT
+            p.lancamento_diario_id,
+            STRING_AGG(DISTINCT fp.nome, \' + \' ORDER BY fp.nome) AS formas
+        FROM pagamentos p
+        JOIN formas_pagamento fp
+            ON fp.id = p.forma_pagamento_id
+        WHERE p.estornado = FALSE
+          AND p.lancamento_diario_id IS NOT NULL
+        GROUP BY p.lancamento_diario_id
+    ) pg
+        ON pg.lancamento_diario_id = h.lancamento_diario_id
 
-    LEFT JOIN LATERAL (
-        SELECT STRING_AGG(DISTINCT fp.nome, ' + ' ORDER BY fp.nome) AS formas
-        FROM pagamentos pag
-        JOIN formas_pagamento fp ON fp.id = pag.forma_pagamento_id
-        WHERE pag.estornado = FALSE
-          AND pag.lancamento_diario_id = l.id
-    ) pg ON TRUE
+    LEFT JOIN (
+        SELECT
+            lancamento_diario_id,
+            STRING_AGG(
+                DISTINCT CASE
+                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'SAIDA\'
+                        THEN \'Crédito utilizado\'
+                    WHEN tipo_saldo = \'CREDITO\' AND operacao = \'ENTRADA\'
+                        THEN \'Crédito gerado\'
+                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'ENTRADA\'
+                        THEN \'Débito pendente\'
+                    WHEN tipo_saldo = \'DEBITO\' AND operacao = \'SAIDA\'
+                        THEN \'Débito pago\'
+                END,
+                \' + \'
+            ) AS movimentos
+        FROM movimentacoes_cliente
+        WHERE lancamento_diario_id IS NOT NULL
+        GROUP BY lancamento_diario_id
+    ) mov
+        ON mov.lancamento_diario_id = h.lancamento_diario_id
 
-    LEFT JOIN LATERAL (
-        SELECT STRING_AGG(
-            DISTINCT CASE
-                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'SAIDA' THEN 'Crédito utilizado'
-                WHEN m.tipo_saldo = 'CREDITO' AND m.operacao = 'ENTRADA' THEN 'Crédito gerado'
-                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'ENTRADA' THEN 'Débito pendente'
-                WHEN m.tipo_saldo = 'DEBITO' AND m.operacao = 'SAIDA' THEN 'Débito pago'
-            END,
-            ' + '
-        ) AS movimentos
-        FROM movimentacoes_cliente m
-        WHERE m.lancamento_diario_id = l.id
-    ) mov ON TRUE
-
-    WHERE l.pet_id = :pet_id
-    ORDER BY f.data_fechamento DESC, l.id DESC
-    LIMIT __LIMIT__ OFFSET __OFFSET__
-SQL;
-
-$sqlHistorico = str_replace(
-    ['__LIMIT__', '__OFFSET__'],
-    [(string) $itensHistoricoPorPagina, (string) $offsetHistorico],
-    $sqlHistorico
-);
+    WHERE h.pet_id = :pet_id
+    ORDER BY h.data_fechamento DESC, h.lancamento_diario_id DESC
+    LIMIT ' . $itensHistoricoPorPagina . ' OFFSET ' . $offsetHistorico;
 
 $stmt = $pdo->prepare($sqlHistorico);
 $stmt->execute([':pet_id' => $id]);
@@ -219,7 +199,16 @@ require __DIR__ . '/../includes/topo.php';
         <div class="message success detail-edit-message">Dados atualizados com sucesso!</div>
     <?php endif; ?>
 
-    <!-- Seção de topo com identidade, resumos do pet e botão de edição alinhado à direita -->
+    <?php if (isset($_GET['erro'])): ?>
+        <div class="message error detail-edit-message">
+            <?php
+                if ($_GET['erro'] === 'permissao') echo 'Você não possui permissão de Administrador para realizar esta exclusão.';
+                else echo 'Não foi possível realizar a exclusão do pet. Tente novamente.';
+            ?>
+        </div>
+    <?php endif; ?>
+
+    <!-- Seção de topo com identidade, resumos do pet e botões de ação alinhados à direita -->
     <section class="detail-card pet-profile-top">
         <div class="pet-profile-identity">
             <?php $fotoPet = urlFotoPet($pet['foto_url'] ?? null); ?>
@@ -271,11 +260,20 @@ require __DIR__ . '/../includes/topo.php';
             </article>
         </div>
 
-        <!-- Botão de edição reposicionado para ficar logo abaixo e alinhado à direita dos cards -->
-        <div class="pet-action-wrapper">
+        <!-- Botão de edição e botão Excluir com o design customizado .danger alinhados à direita -->
+        <div class="pet-action-wrapper" style="display: flex; gap: 10px; align-items: center; justify-content: flex-end;">
             <a class="detail-edit-button" href="cadastro-pet.php?editar=<?= (int) $id ?>">
                 Editar pet
             </a>
+
+            <?php if ($ehAdministrador): ?>
+                <form method="post" id="formExcluirPet" onsubmit="return confirm('Tem certeza que deseja excluir este pet? Esta ação desativará o registro do sistema.');" style="margin: 0;">
+                    <input type="hidden" name="acao" value="excluir_pet">
+                    <button type="submit" class="detail-edit-button icon-action-button danger" style="background: #ffe4e4; color: #b21f1f; border: 1px solid #f0cbc8;">
+                        Excluir
+                    </button>
+                </form>
+            <?php endif; ?>
         </div>
     </div>
 </section>
