@@ -42,22 +42,35 @@ $podeCriarUsuario = !$usuariosAtivos
     || (($usuarioAtual['perfil'] ?? null) === 'ADMINISTRADOR');
 
 // Conta as solicitações pendentes vindas do aplicativo mobile.
-// O sino usa esse total para acender imediatamente quando a página é carregada.
+// Esse dado aparece em TODAS as páginas, então mantemos um cache curto na sessão
+// para não fazer a mesma consulta ao Supabase a cada clique do menu.
 $totalSolicitacoesPendentesTopo = 0;
+$cacheSolicitacoesTopo = $_SESSION['bp_cache_solicitacoes_topo'] ?? null;
 
-try {
-    $stmtNotificacaoTopo = $pdo->query(
-        "SELECT COUNT(*)
-         FROM agendamentos
-         WHERE origem = 'MOBILE'
-           AND status = 'SOLICITADO'"
-    );
+if (
+    is_array($cacheSolicitacoesTopo)
+    && (int) ($cacheSolicitacoesTopo['expira_em'] ?? 0) >= time()
+) {
+    $totalSolicitacoesPendentesTopo = (int) ($cacheSolicitacoesTopo['total'] ?? 0);
+} else {
+    try {
+        $stmtNotificacaoTopo = $pdo->query(
+            "SELECT COUNT(*)
+             FROM agendamentos
+             WHERE origem = 'MOBILE'
+               AND status = 'SOLICITADO'"
+        );
 
-    $totalSolicitacoesPendentesTopo = (int) $stmtNotificacaoTopo->fetchColumn();
-} catch (Throwable $erroNotificacaoTopo) {
-    // O cabeçalho não deve impedir o restante do sistema de abrir
-    // se houver uma falha momentânea na consulta das notificações.
-    $totalSolicitacoesPendentesTopo = 0;
+        $totalSolicitacoesPendentesTopo = (int) $stmtNotificacaoTopo->fetchColumn();
+        $_SESSION['bp_cache_solicitacoes_topo'] = [
+            'total' => $totalSolicitacoesPendentesTopo,
+            'expira_em' => time() + 15,
+        ];
+    } catch (Throwable $erroNotificacaoTopo) {
+        // O cabeçalho não deve impedir o restante do sistema de abrir
+        // se houver uma falha momentânea na consulta das notificações.
+        $totalSolicitacoesPendentesTopo = 0;
+    }
 }
 ?>
 <!DOCTYPE html>
