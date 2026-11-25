@@ -125,6 +125,10 @@ try {
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => $usarPrepareEmulado,
+            // Reaproveita a conexão entre requisições do mesmo processo PHP.
+            // Com Supabase remoto isso evita repetir parte do custo de conexão/TLS
+            // a cada clique entre páginas.
+            PDO::ATTR_PERSISTENT          => true,
         ]
     );
     $pdo->exec("SET TIME ZONE 'America/Sao_Paulo'");
