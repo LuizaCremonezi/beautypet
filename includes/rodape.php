@@ -1014,23 +1014,23 @@ if (requestNotificationBell && requestNotificationBadge) {
 
 
     atualizarVisualSino(ultimoTotalSolicitacoes);
-    consultarSolicitacoesMobile();
 
-    // Consulta a cada 8 segundos.
+    // O valor inicial já veio renderizado pelo PHP. Evitamos uma segunda chamada
+    // ao banco imediatamente após cada navegação e atualizamos em intervalos maiores.
+    let ultimaConsultaSolicitacoes = Date.now();
+    const intervaloSolicitacoes = 30000;
 
-    window.setInterval(consultarSolicitacoesMobile, 8000);
+    window.setInterval(() => {
+        ultimaConsultaSolicitacoes = Date.now();
+        consultarSolicitacoesMobile();
+    }, intervaloSolicitacoes);
 
-
-    // Também confere imediatamente quando o usuário volta para esta aba.
-
+    // Ao voltar para a aba, consulta apenas se o último pedido já estiver antigo.
     document.addEventListener("visibilitychange", () => {
-
-        if (!document.hidden) {
-
+        if (!document.hidden && Date.now() - ultimaConsultaSolicitacoes >= intervaloSolicitacoes) {
+            ultimaConsultaSolicitacoes = Date.now();
             consultarSolicitacoesMobile();
-
         }
-
     });
 
 }
