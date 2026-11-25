@@ -2209,6 +2209,7 @@ $stmt = $pdo->prepare(
         FROM pagamentos p
         JOIN formas_pagamento fp ON fp.id = p.forma_pagamento_id
         WHERE p.estornado = FALSE
+          AND p.fechamento_diario_id = :fechamento_pg
         GROUP BY p.lancamento_diario_id
      ) pg ON pg.lancamento_diario_id = l.id
      LEFT JOIN (
@@ -2236,13 +2237,18 @@ $stmt = $pdo->prepare(
                 END
             ) AS debito_pago
         FROM movimentacoes_cliente
+        WHERE fechamento_diario_id = :fechamento_mov
         GROUP BY lancamento_diario_id
      ) mov ON mov.lancamento_diario_id = l.id
      WHERE l.fechamento_diario_id = :fechamento
      ORDER BY l.id"
 );
 // Executa a instrução preparada enviando os parâmetros de forma separada e segura.
-$stmt->execute([':fechamento' => $fechamentoId]);
+$stmt->execute([
+    ':fechamento'     => $fechamentoId,
+    ':fechamento_pg'  => $fechamentoId,
+    ':fechamento_mov' => $fechamentoId,
+]);
 // Transforma todas as linhas retornadas pela consulta em uma lista para uso na página.
 $lancamentosBrutos = $stmt->fetchAll();
 
